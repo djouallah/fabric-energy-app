@@ -16,30 +16,6 @@
       "contextAudiences": [
         "Storage"
       ]
-    },
-    {
-      "functionName": "getLogUploadUrl",
-      "delegateParameters": [
-        {
-          "name": "name",
-          "type": "string",
-          "optional": false,
-          "hasDefault": false,
-          "position": 0,
-          "isFabricParameter": false
-        },
-        {
-          "name": "ctx",
-          "type": "RayfinContext<BlankAppSchema, AudienceType.Storage>",
-          "optional": false,
-          "hasDefault": false,
-          "position": 1,
-          "isFabricParameter": false
-        }
-      ],
-      "contextAudiences": [
-        "Storage"
-      ]
     }
   ]
 }

@@ -53,7 +53,6 @@
 
     const crossFilter = { fuel: null, region: null, duids: [] };
     let _renderSeq = 0;
-    let currentUser = null;   // signed-in identity, captured once the session is established
 
     function updateFilterTags() {
       const el = document.getElementById("activeFilters");
@@ -97,137 +96,6 @@
     const _queryCache = new Map();
     function clearQueryCache() { _queryCache.clear(); }
 
-    const _queryLog = [];
-    // CSV with one row per logged query: ISO timestamp + signed-in user_id + SQL/metrics.
-    function queryLogCsv() {
-      return ['#,timestamp,user_id,sql,records,duration_ms',
-        ..._queryLog.map(e => `${e.n},${e.ts},${e.user},"${e.sql.replace(/"/g,'""')}",${e.rows},${e.ms}`)
-      ].join('\n');
-    }
-    window.downloadQueryLog = () => {
-      const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(new Blob([queryLogCsv()], {type:'text/csv'})), download: 'query_log.csv' });
-      a.click();
-    };
-    // Persist the log to OneLake (one CSV per save, partitioned by user). No-op-with-message when
-    // there's nothing to save or the deploy has no OneLake base (same-origin/static).
-    window.saveQueryLogToOneLake = async () => {
-      if (!_queryLog.length) { alert('Query log is empty — run a query first.'); return; }
-      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const path = `query_logs/data/query_log_${stamp}.csv`;
-      setStatus('Saving query log to OneLake…', 'loading');
-      try {
-        const url = await data.uploadFile(path, queryLogCsv(), 'text/csv');
-        console.log('[QueryLog] saved to', url);
-        setStatus(window._cutoffCached || 'Query log saved to OneLake', 'connected');
-      } catch (e) {
-        console.error('[QueryLog] OneLake save failed', e);
-        setStatus('OneLake save failed: ' + e.message, 'error');
-        alert('Failed to save query log to OneLake: ' + e.message);
-      }
-    };
-
-    // --- Auto-export the query log to OneLake (periodic autosave + crash-safe buffer) ---
-    // Live autosave overwrites ONE per-session file so OneLake stays ~current; a localStorage buffer
-    // written on page-hide is the safety net — it survives a hard close / expired token and is
-    // uploaded on the next load. Both are no-ops unless a OneLake base is configured.
-    const SESSION_ID = new Date().toISOString().replace(/[:.]/g, '-') + '-' + Math.random().toString(36).slice(2, 8);
-    const QLOG_BUFFER_PREFIX = 'rayfin_qlog_pending_';
-    function oneLakeConfigured() { return data.canUpload(); }
-    // All sessions write into one folder (user_id is a column in the CSV); the session id keeps
-    // concurrent sessions from clobbering each other and lets DuckDB read query_logs/data/*.csv.
-    function sessionLogPath() {
-      return `query_logs/data/session_${SESSION_ID}.csv`;
-    }
-
-    let _flushTimer = null;
-    let _flushInFlight = false;
-    // Debounced live flush: overwrite the session file ~10s after the last query.
-    function scheduleQueryLogFlush() {
-      if (!oneLakeConfigured() || !_queryLog.length || _flushTimer) return;
-      _flushTimer = setTimeout(async () => {
-        _flushTimer = null;
-        if (_flushInFlight) { scheduleQueryLogFlush(); return; }   // coalesce behind the in-flight one
-        _flushInFlight = true;
-        try {
-          await data.uploadFile(sessionLogPath(), queryLogCsv(), 'text/csv');
-        } catch (e) {
-          console.warn('[QueryLog] autosave failed (buffer on close will cover it):', e.message);
-        } finally {
-          _flushInFlight = false;
-        }
-      }, 10000);
-    }
-
-    // Crash-safe: on page-hide, synchronously stash the log in localStorage for upload on next load.
-    function bufferQueryLogToLocalStorage() {
-      if (!oneLakeConfigured() || !_queryLog.length) return;
-      try {
-        localStorage.setItem(QLOG_BUFFER_PREFIX + SESSION_ID,
-          JSON.stringify({ path: sessionLogPath(), csv: queryLogCsv() }));
-      } catch (e) { /* quota / disabled storage — best effort */ }
-    }
-
-    // Upload buffers left by previous sessions (a prior hard close), then clear each on success.
-    async function uploadPendingQueryLogs() {
-      if (!oneLakeConfigured()) return;
-      for (let i = localStorage.length - 1; i >= 0; i--) {
-        const key = localStorage.key(i);
-        if (!key || !key.startsWith(QLOG_BUFFER_PREFIX)) continue;
-        try {
-          const { path, csv } = JSON.parse(localStorage.getItem(key) || '{}');
-          if (path && csv) {
-            await data.uploadFile(path, csv, 'text/csv');
-            localStorage.removeItem(key);   // only drop after a successful upload
-          } else {
-            localStorage.removeItem(key);   // malformed entry — discard
-          }
-        } catch (e) {
-          console.warn('[QueryLog] pending buffer upload failed, will retry next load:', key, e.message);
-        }
-      }
-    }
-
-    // visibilitychange→hidden is the most reliable "last chance" across desktop/mobile; pagehide
-    // backs it up. Both just write localStorage — no network on the unload path.
-    addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') bufferQueryLogToLocalStorage(); });
-    addEventListener('pagehide', bufferQueryLogToLocalStorage);
-    let _logSort = { key: 'n', dir: 1 };   // default: insertion order, ascending
-    const _logHeaders = {};
-    function appendQueryLog(entry) {
-      _queryLog.push(entry);
-      renderQueryLog();
-      scheduleQueryLogFlush();   // debounced live autosave to OneLake (no-op if not configured)
-    }
-    function renderQueryLog() {
-      const tbody = document.querySelector('#queryLogTable tbody');
-      if (!tbody) return;
-      const { key, dir } = _logSort;
-      const textKey = key === 'sql' || key === 'ts' || key === 'user';
-      const sorted = [..._queryLog].sort((a, b) =>
-        textKey
-          ? String(a[key]).localeCompare(String(b[key])) * dir
-          : (Number(a[key]) - Number(b[key])) * dir);
-      // User/email is intentionally NOT rendered (kept demo-friendly); it's still on every entry
-      // and in the CSV / OneLake export.
-      tbody.innerHTML = sorted.map(e =>
-        `<tr><td>${e.n}</td><td style="white-space:nowrap;font-size:0.72rem">${e.ts}</td><td style="font-family:monospace;font-size:0.72rem;white-space:pre-wrap;word-break:break-all">${e.sql.replace(/</g,'&lt;')}</td><td>${e.rows}</td><td>${e.ms}</td></tr>`
-      ).join('');
-      for (const th of document.querySelectorAll('#queryLogTable thead th')) {
-        const k = th.dataset.sort;
-        th.textContent = (_logHeaders[k] ?? th.textContent) + (k === key ? (dir > 0 ? ' ▲' : ' ▼') : '');
-      }
-    }
-    // Wire the headers for click-to-sort (toggles direction on the active column).
-    for (const th of document.querySelectorAll('#queryLogTable thead th')) {
-      _logHeaders[th.dataset.sort] = th.textContent;
-      th.style.cursor = 'pointer';
-      th.style.userSelect = 'none';
-      th.addEventListener('click', () => {
-        _logSort = { key: th.dataset.sort, dir: _logSort.key === th.dataset.sort ? -_logSort.dir : 1 };
-        renderQueryLog();
-      });
-    }
-
     // opts.noCache: skip the result cache. Required for the render path — base scans write a
     // mutable TEMP TABLE and the chart queries over it have filter-invariant SQL, so a cached
     // result keyed on that constant string would survive a filter change and serve stale rows.
@@ -236,7 +104,6 @@
         const cached = _queryCache.get(sqlStr);
         if (cached) return cached;
       }
-      const t0 = performance.now();
       const result = await conn.query(sqlStr);
       const numRows = Number(result.numRows);
       const fields = result.schema.fields;
@@ -257,8 +124,6 @@
         rows[i] = row;
       }
       _queryCache.set(sqlStr, rows);
-      // Collapse the source-code indentation/newlines for a tidy log entry (display only).
-      appendQueryLog({ n: _queryLog.length + 1, ts: new Date().toISOString(), user: currentUser || 'anonymous', ms: (performance.now() - t0).toFixed(1), rows: numRows, sql: sqlStr.replace(/\s+/g, ' ').trim() });
       return rows;
     }
 
@@ -893,7 +758,6 @@
         const tab = btn.dataset.tab;
         document.getElementById('view-dashboard').style.display = tab === 'dashboard' ? '' : 'none';
         document.getElementById('view-analyze').style.display = tab === 'analyze' ? '' : 'none';
-        document.getElementById('view-log').style.display = tab === 'log' ? '' : 'none';
         // Populate the SQL box the first time Analyze is opened; don't clobber manual edits after.
         if (tab === 'analyze' && !document.getElementById('analyzeSql').value.trim()) syncAnalyzeSql();
       });
@@ -1298,8 +1162,6 @@
         setStatus("Activating multi-threading...", "loading");
         return;
       }
-      currentUser = auth.getUserId();   // session is live by now — tag log entries with this identity
-      uploadPendingQueryLogs().catch(e => console.warn('[QueryLog] pending upload error:', e));   // flush prior-session buffers (fire-and-forget)
       const { db, conn: c } = await data.init();
       _db = db;
       conn = c;

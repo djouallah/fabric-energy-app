@@ -26,10 +26,9 @@ from the app's own origin.
 - **Auth:** the browser signs in with **Rayfin's Fabric SSO** (no extra login; inside the Fabric portal
   iframe the session is handed over by `postMessage`) and calls Rayfin Functions
   (`rayfin/functions/src/function_app.ts`). They hold the app identity's OneLake token **server-side** and
-  return OneLake **user-delegation SAS** tokens: read-only on the `data/` folder (`getDataSas`), and
-  create/write on one query-log CSV (`getLogUploadUrl`). The browser never holds a storage token. SAS
-  last ~55 min and are cached (the data SAS in localStorage across reloads), so a visitor calls the
-  functions about once an hour. Plain HTTPS fetch — no `azure` DuckDB extension.
+  return a OneLake **user-delegation SAS**, read-only on the `data/` folder (`getDataSas`). The browser
+  never holds a storage token. The SAS lasts ~55 min and is cached in localStorage across reloads, so a
+  visitor calls the function about once an hour. Plain HTTPS fetch — no `azure` DuckDB extension.
 
 ```
 browser (DuckDB-WASM)  ──fetch data/<file>?<SAS>──►  OneLake (data/ folder, read-only)
@@ -43,8 +42,8 @@ You need a Fabric workspace with a lakehouse:
 
 - Workspace settings → OneLake → turn on **Authenticate with OneLake user-delegated SAS tokens** (off by
   default; the tenant setting *Use short-lived user-delegated SAS tokens* is on by default).
-- The owner of the Fabric app item must be able to read the lakehouse and write `query_logs/` — the SAS
-  can never exceed that identity's permissions.
+- The owner of the Fabric app item must be able to read the lakehouse — the SAS can never exceed that
+  identity's permissions.
 - After the first `rayfin up`, store the lakehouse Files URL as a Rayfin secret:
   `echo https://onelake.dfs.fabric.microsoft.com/<ws>/<lh>.Lakehouse/Files | npx rayfin secret set ONELAKE_FILES_URL --stdin`
 - `cp site/config.example.js site/config.js` (`auth: "rayfin"` needs no ids — they come from the
@@ -64,8 +63,8 @@ Open it inside the Fabric portal or in its own tab (one Fabric sign-in click the
 
 ## limitations
 
-- **Users see the SAS** (DevTools): read-only on `data/` (keep only public data there) or create/write
-  on one query-log CSV, ~55 min. Per-user OneLake permissions don't apply.
+- **Users see the SAS** (DevTools): read-only on `data/` for ~55 min — keep only public data there.
+  Per-user OneLake permissions don't apply.
 - **Single-threaded** DuckDB-WASM in `rayfin` mode. Multi-threading needs cross-origin isolation
   (COOP/COEP): the Fabric portal iframe can never be isolated, and COOP severs the Fabric sign-in popup.
 - No data is committed here; it lives in your OneLake. No secrets are committed.

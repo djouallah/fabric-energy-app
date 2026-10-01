@@ -153,35 +153,5 @@ export function createDataSource(cfg = {}, auth, { onStatus = () => {} } = {}) {
     return { db, conn };
   }
 
-  // Write a small file to OneLake via the Blob endpoint single PUT (one atomic request with the
-  // body inline). `relPath` is resolved under the configured Files base, e.g.
-  // 'query_logs/<user>/<file>.csv'. We deliberately do NOT use the ADLS Gen2 DFS create→append→flush
-  // sequence: from a browser that left 0-byte files (the append's required Content-Length is a
-  // forbidden header we can't set, and a redirect on the PATCH drops the body). The single PUT
-  // writes the bytes in one shot. Rayfin: the URL is a create/write SAS for exactly that file.
-  // Otherwise: needs a OneLake baseUrl + bearer headers; throws where baseUrl is empty.
-  async function uploadFile(relPath, content, contentType = 'application/octet-stream') {
-    if (!canUpload()) throw new Error('OneLake write needs dataBaseUrl to be set (it is empty on same-origin/static deploys).');
-    relPath = String(relPath).replace(/^\/+/, '');
-    // The DFS read host doesn't take blob PUTs — target the Blob endpoint for the write.
-    const sign = async () => signed
-      ? auth.signedUploadUrl(relPath)
-      : `${baseUrl}/${relPath}`.replace('onelake.dfs.fabric.microsoft.com', 'onelake.blob.fabric.microsoft.com');
-    let url = await sign();
-    const bytes = new TextEncoder().encode(content);
-    const run = () => fetch(url, {
-      method: 'PUT',
-      headers: { ...auth.getHeaders(), 'x-ms-blob-type': 'BlockBlob', 'Content-Type': contentType },
-      body: bytes,
-    });
-    // Retry once after re-auth on a 401/403 (stale token or expired SAS), mirroring the read path.
-    let r = await run();
-    if (authFailed(r)) { await auth.refresh(); url = await sign(); r = await run(); }
-    if (!r.ok) throw new Error(`OneLake upload failed: HTTP ${r.status}`);
-    return url.split('?')[0];
-  }
-
-  function canUpload() { return signed || !!baseUrl; }
-
-  return { init, uploadFile, canUpload };
+  return { init };
 }

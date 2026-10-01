@@ -142,7 +142,6 @@
   <div class="tab-bar">
     <button class="tab-btn active" data-tab="dashboard">Dashboard</button>
     <button class="tab-btn" data-tab="analyze">Analyze</button>
-    <button class="tab-btn" data-tab="log">Query Log</button>
   </div>
 
   <div id="view-dashboard">
@@ -205,16 +204,6 @@
     <div class="analyze-info" id="analyzeInfo"></div>
     <div class="analyze-table-wrap">
       <table class="analyze-table" id="analyzeTable"></table>
-    </div>
-  </div>
-
-  <div id="view-log" style="display:none">
-    <div style="padding:0.6rem 2rem;display:flex;gap:0.6rem"><button class="btn-analyze" onclick="downloadQueryLog()">Download CSV</button><button class="btn-analyze" onclick="saveQueryLogToOneLake()">Save to OneLake</button></div>
-    <div class="analyze-table-wrap">
-      <table class="analyze-table" id="queryLogTable">
-        <thead><tr><th data-sort="n">#</th><th data-sort="ts">Timestamp</th><th data-sort="sql">SQL</th><th data-sort="rows">Records</th><th data-sort="ms">Duration (ms)</th></tr></thead>
-        <tbody></tbody>
-      </table>
     </div>
   </div>
 

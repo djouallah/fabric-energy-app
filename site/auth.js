@@ -10,7 +10,6 @@
 //   const auth = createAuth(cfg);
 //   if (await auth.ensureSession(false)) { /* signed in */ }
 //   auth.dataAccess?.()  -> { baseUrl, sas }   (rayfin only; data.js uses it when present)
-//   auth.signedUploadUrl?.(relPath) -> url
 // =============================================================================
 
 // Keep these on the same version: jsDelivr resolves their shared deps (rayfin-auth, rayfin-lib)
@@ -24,17 +23,15 @@ function createNoAuth() {
     mode: 'none',
     async ensureSession() { return true; },
     getHeaders() { return {}; },
-    getUserId() { return 'anonymous'; },
     async refresh() { return true; },
   };
 }
 
 // --- Rayfin provider: Fabric SSO session (no second login; inside the Fabric portal iframe the
 // session is handed over by postMessage), or no session at all when the app allows anonymous
-// access. The browser never holds a storage token: the getDataSas / getLogUploadUrl functions
-// (rayfin/functions) sign OneLake SAS — read-only on the data/ folder, create/write on one
-// query-log CSV — valid ~55 min. Both are cached (the data SAS across reloads, in localStorage) so
-// a visitor calls the functions about once an hour. Backend URL, key and Fabric coordinates come
+// access. The browser never holds a storage token: the getDataSas function (rayfin/functions)
+// signs a read-only OneLake SAS on the data/ folder, valid ~55 min and cached in localStorage
+// across reloads, so a visitor calls the function about once an hour. Backend URL, key and Fabric coordinates come
 // from the rayfin.config.json that `rayfin up` writes next to the site.
 function createRayfinAuth() {
   const RENEW_MARGIN_MS = 3 * 60 * 1000;   // re-sign this long before a SAS expires
@@ -43,7 +40,6 @@ function createRayfinAuth() {
   let _fabric = null;
   let _fabricOpts = null;
   let _data = load();                      // { baseUrl, sas, expiresOn } from getDataSas
-  const _uploads = new Map();              // relPath -> { url, expiresOn } from getLogUploadUrl
 
   // localStorage can be unavailable (private mode, blocked storage): the cache is best-effort.
   function load() { try { return JSON.parse(localStorage.getItem(DATA_SAS_KEY)); } catch (e) { return null; } }
@@ -91,27 +87,11 @@ function createRayfinAuth() {
     mode: 'rayfin',
     ensureSession,
     getHeaders() { return {}; },
-    getUserId() {
-      const u = _client && _client.auth.getSession()?.user;
-      return (u && (u.email || u.id)) || null;
-    },
     dataAccess,
-    async signedUploadUrl(relPath) {
-      const m = String(relPath).match(/^query_logs\/data\/([^/]+)$/);
-      if (!m) throw new Error(`no signed upload for ${relPath}`);
-      let signed = _uploads.get(relPath);
-      if (!fresh(signed)) {
-        await init();
-        signed = await _client.functions.getLogUploadUrl.invoke({ name: m[1] });
-        _uploads.set(relPath, signed);
-      }
-      return signed.url;
-    },
     // Drop cached SAS (e.g. after a 403) so the next call re-signs.
     async refresh() {
       _data = null;
       save(null);
-      _uploads.clear();
       return true;
     },
   };
