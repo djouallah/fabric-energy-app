@@ -23,24 +23,31 @@ from the app's own origin.
   ~440 MB** — an accepted trade-off for keeping everything in a single file. The dashboard also has no
   pre-aggregated daily tables in the file, so it **materializes small daily rollups once at load** to keep
   wide-range (daily-grain) charts fast over the 45 M-row 5-min fact.
-- **Auth:** OneLake needs a `storage.azure.com` token. The browser signs in with **Rayfin's Fabric SSO**
-  (no extra login; inside the Fabric portal iframe the session is handed over by `postMessage`) and calls
-  one Rayfin Function, `getStorageToken` (`rayfin/functions/src/function_app.ts`), which returns a OneLake
-  token issued to the **app identity** (the owner of the Fabric app item). The token is sent as
-  `Authorization: Bearer …` on each `fetch`. No `azure` DuckDB extension required — plain `httpfs`.
+- **Auth:** the browser signs in with **Rayfin's Fabric SSO** (no extra login; inside the Fabric portal
+  iframe the session is handed over by `postMessage`) and calls Rayfin Functions
+  (`rayfin/functions/src/function_app.ts`). They hold the app identity's OneLake token **server-side** and
+  return a **OneLake user-delegation SAS URL for exactly one file**, ~15 min: read-only for the current
+  `.duckdb` (`getDataUrl`, which also resolves `data/latest.txt`), create/write for one query-log CSV
+  (`getLogUploadUrl`). The browser never holds a storage token. Plain HTTPS fetch — no `azure` extension.
 
 ```
-browser (DuckDB-WASM)  ──fetch + Bearer──►  OneLake (data.duckdb)
+browser (DuckDB-WASM)  ──fetch <file>?<SAS>──►  OneLake (one data_*.duckdb, read-only)
         ▲
-        └── Rayfin Fabric SSO → getStorageToken function → storage.azure.com token (app identity)
+        └── Rayfin Fabric SSO → getDataUrl function (app identity token stays here) → single-file SAS
 ```
 
 ## Setup
 
-You need a Fabric workspace with a lakehouse. Put your OneLake base URL into `site/config.js`
-(`cp site/config.example.js site/config.js`; `auth: "rayfin"` needs no ids — they come from the
-`rayfin.config.json` that `rayfin up` writes). The owner of the Fabric app item must be able to read the
-lakehouse (and write `query_logs/`), since the function's token carries that identity.
+You need a Fabric workspace with a lakehouse:
+
+- Workspace settings → OneLake → turn on **Authenticate with OneLake user-delegated SAS tokens** (off by
+  default; the tenant setting *Use short-lived user-delegated SAS tokens* is on by default).
+- The owner of the Fabric app item must be able to read the lakehouse and write `query_logs/` — the SAS
+  can never exceed that identity's permissions.
+- After the first `rayfin up`, store the lakehouse Files URL as a Rayfin secret:
+  `echo https://onelake.dfs.fabric.microsoft.com/<ws>/<lh>.Lakehouse/Files | npx rayfin secret set ONELAKE_FILES_URL --stdin`
+- `cp site/config.example.js site/config.js` (`auth: "rayfin"` needs no ids — they come from the
+  `rayfin.config.json` that `rayfin up` writes).
 
 Everything else is Rayfin — see the [Rayfin documentation](https://learn.microsoft.com/fabric/embedded/rayfin/overview) for full details:
 
@@ -56,9 +63,9 @@ Open it inside the Fabric portal or in its own tab (one Fabric sign-in click the
 
 ## limitations
 
-- **Everyone reads OneLake as the app owner.** The function's token is the app identity's, and it is
-  handed to the browser, so any user who can open the app gets (for the token's ~1 h lifetime) whatever
-  OneLake access the app item's owner has. Per-user OneLake permissions don't apply.
+- **Users see the SAS URLs** (DevTools), but each one opens a single file with a single permission for
+  ~15 min: the dashboard DB read-only, or one query-log CSV create/write. Anyone who can open the app
+  can therefore read that DB — which is the point of the app. Per-user OneLake permissions don't apply.
 - **Single-threaded** DuckDB-WASM in `rayfin` mode. Multi-threading needs cross-origin isolation
   (COOP/COEP): the Fabric portal iframe can never be isolated, and COOP severs the Fabric sign-in popup.
 - No data is committed here; it lives in your OneLake. No secrets are committed.

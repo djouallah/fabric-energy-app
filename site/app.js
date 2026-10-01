@@ -132,7 +132,7 @@
     // uploaded on the next load. Both are no-ops unless a OneLake base is configured.
     const SESSION_ID = new Date().toISOString().replace(/[:.]/g, '-') + '-' + Math.random().toString(36).slice(2, 8);
     const QLOG_BUFFER_PREFIX = 'rayfin_qlog_pending_';
-    function oneLakeConfigured() { return !!(cfg.dataBaseUrl || cfg.oneLakeBase); }
+    function oneLakeConfigured() { return data.canUpload(); }
     // All sessions write into one folder (user_id is a column in the CSV); the session id keeps
     // concurrent sessions from clobbering each other and lets DuckDB read query_logs/data/*.csv.
     function sessionLogPath() {

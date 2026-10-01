@@ -4,12 +4,14 @@
 // Platform-agnostic data loading. Given an AuthProvider (auth.js) and config, it:
 //   1. instantiates DuckDB-WASM,
 //   2. resolves the latest .duckdb file (OneLake `latest.txt` pointer, if any),
-//   3. fetches + OPFS-caches it (conditional GET via ETag), carrying auth headers,
+//   3. fetches + OPFS-caches it (conditional GET via ETag),
 //   4. ATTACHes it as `db` (READ_ONLY).
 //
-// Base-URL precedence: cfg.dataBaseUrl ?? cfg.oneLakeBase ?? ''.
-//   non-empty -> fetch `<base>/data/<file>.duckdb` with auth headers (OneLake).
-//   ''        -> same-origin `./data/data.duckdb`, no auth (bundled / public static host).
+// Where the file comes from:
+//   auth.signedDataUrl present (rayfin) -> a single-file OneLake SAS URL from the backend.
+//   else cfg.dataBaseUrl ?? cfg.oneLakeBase ?? '':
+//     non-empty -> fetch `<base>/data/<file>.duckdb` with auth headers.
+//     ''        -> same-origin `./data/data.duckdb`, no auth (bundled / public static host).
 //
 // Contract: after init(), schema `db` exists with
 //   fct_summary(date,time,DUID,mw,price,cutoff), dim_duid(...), dim_calendar(...).
@@ -21,14 +23,19 @@ import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.32.0
 
 export function createDataSource(cfg = {}, auth, { onStatus = () => {} } = {}) {
   const baseUrl = cfg.dataBaseUrl ?? cfg.oneLakeBase ?? '';
+  const signed = typeof auth.signedDataUrl === 'function';
+  // An expired/invalid token is a 401; an expired SAS is a 403.
+  const authFailed = (resp) => resp.status === 401 || resp.status === 403;
 
   // Cache a remote .duckdb file in OPFS using the file's ETag for freshness.
   // OneLake honors conditional GETs, so on every load we send If-None-Match:
   //   304 -> file unchanged, use the OPFS copy (no download)
   //   200 -> file changed (or first load) -> download + store new ETag
   // => a plain refresh automatically picks up new data; no manual versioning.
+  // `renewUrl` (optional) re-signs the URL after an auth failure; otherwise the same URL is retried
+  // with refreshed auth headers.
   // source: 'opfs-hit' | 'opfs-miss' | 'opfs-refresh'
-  async function cacheInOPFS(db, url, filename) {
+  async function cacheInOPFS(db, url, filename, renewUrl) {
     const root = await navigator.storage.getDirectory();
     const etagKey = `opfs_etag_${filename}`;
     const cachedEtag = localStorage.getItem(etagKey);
@@ -39,9 +46,11 @@ export function createDataSource(cfg = {}, auth, { onStatus = () => {} } = {}) {
       return fetch(url, { headers });
     };
 
+    const renew = async () => { await auth.refresh(); if (renewUrl) url = await renewUrl(); };
+
     onStatus("Checking for updates...");
     let resp = await doFetch(true);
-    if (resp.status === 401) { await auth.refresh(); resp = await doFetch(true); }
+    if (authFailed(resp)) { await renew(); resp = await doFetch(true); }
 
     // Unchanged -> reuse the OPFS copy.
     if (resp.status === 304) {
@@ -54,7 +63,7 @@ export function createDataSource(cfg = {}, auth, { onStatus = () => {} } = {}) {
       } catch (e) {
         console.log(`[OPFS] 304 but no OPFS copy for ${filename}, re-downloading`);
         resp = await doFetch(false); // unconditional
-        if (resp.status === 401) { await auth.refresh(); resp = await doFetch(false); }
+        if (authFailed(resp)) { await renew(); resp = await doFetch(false); }
       }
     }
 
@@ -120,20 +129,18 @@ export function createDataSource(cfg = {}, auth, { onStatus = () => {} } = {}) {
 
     const conn = await db.connect();
 
-    let dbResult, dbFile;
-    try {
+    // No fallback to a bundled copy: if OneLake is unreachable the dashboard must say so, not
+    // silently show stale demo data.
+    let dbFile, url, renewUrl;
+    if (signed) {
+      ({ file: dbFile, url } = await auth.signedDataUrl());
+      renewUrl = async () => (await auth.signedDataUrl()).url;
+    } else {
       dbFile = await resolveLatestDuckDB();
-      const url = baseUrl ? `${baseUrl}/data/${dbFile}` : './data/data.duckdb';
-      dbResult = await cacheInOPFS(db, url, dbFile);
-      await evictOldDuckDBs(dbFile);
-    } catch (e) {
-      // OneLake unreachable (offline, token, CORS) -> fall back to a same-origin bundled copy.
-      console.warn('[data] remote fetch failed, falling back to local data.duckdb:', e.message);
-      onStatus('Data source unavailable, loading local data…');
-      auth._clearToken?.();
-      dbFile = 'data.duckdb';
-      dbResult = await cacheInOPFS(db, './data/data.duckdb', 'data.duckdb');
+      url = baseUrl ? `${baseUrl}/data/${dbFile}` : './data/data.duckdb';
     }
+    const dbResult = await cacheInOPFS(db, url, dbFile, renewUrl);
+    await evictOldDuckDBs(dbFile);
     await conn.query(`ATTACH '${dbFile}' AS db (READ_ONLY);`);
     await conn.query("SET preserve_insertion_order = false;");
 
@@ -149,25 +156,30 @@ export function createDataSource(cfg = {}, auth, { onStatus = () => {} } = {}) {
   // 'query_logs/<user>/<file>.csv'. We deliberately do NOT use the ADLS Gen2 DFS create→append→flush
   // sequence: from a browser that left 0-byte files (the append's required Content-Length is a
   // forbidden header we can't set, and a redirect on the PATCH drops the body). The single PUT
-  // writes the bytes in one shot. Requires a OneLake baseUrl and an auth provider yielding a
-  // storage.azure.com bearer token; throws on a same-origin/static deploy where baseUrl is empty.
+  // writes the bytes in one shot. Rayfin: the URL is a create/write SAS for exactly that file.
+  // Otherwise: needs a OneLake baseUrl + bearer headers; throws where baseUrl is empty.
   async function uploadFile(relPath, content, contentType = 'application/octet-stream') {
-    if (!baseUrl) throw new Error('OneLake write needs dataBaseUrl to be set (it is empty on same-origin/static deploys).');
+    if (!canUpload()) throw new Error('OneLake write needs dataBaseUrl to be set (it is empty on same-origin/static deploys).');
+    relPath = String(relPath).replace(/^\/+/, '');
     // The DFS read host doesn't take blob PUTs — target the Blob endpoint for the write.
-    const url = `${baseUrl}/${String(relPath).replace(/^\/+/, '')}`
-      .replace('onelake.dfs.fabric.microsoft.com', 'onelake.blob.fabric.microsoft.com');
+    const sign = async () => signed
+      ? auth.signedUploadUrl(relPath)
+      : `${baseUrl}/${relPath}`.replace('onelake.dfs.fabric.microsoft.com', 'onelake.blob.fabric.microsoft.com');
+    let url = await sign();
     const bytes = new TextEncoder().encode(content);
     const run = () => fetch(url, {
       method: 'PUT',
       headers: { ...auth.getHeaders(), 'x-ms-blob-type': 'BlockBlob', 'Content-Type': contentType },
       body: bytes,
     });
-    // Retry once through auth.refresh() on a 401 (stale token), mirroring the read path.
+    // Retry once after re-auth on a 401/403 (stale token or expired SAS), mirroring the read path.
     let r = await run();
-    if (r.status === 401) { await auth.refresh(); r = await run(); }
+    if (authFailed(r)) { await auth.refresh(); url = await sign(); r = await run(); }
     if (!r.ok) throw new Error(`OneLake upload failed: HTTP ${r.status}`);
-    return url;
+    return url.split('?')[0];
   }
 
-  return { init, uploadFile };
+  function canUpload() { return signed || !!baseUrl; }
+
+  return { init, uploadFile, canUpload };
 }

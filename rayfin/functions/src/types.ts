@@ -17,8 +17,12 @@
  */
 
 export type AppFunctionsSchema = {
-  getStorageToken: {
+  getDataUrl: {
     input: Record<string, never>;
-    output: { token: string };
+    output: { file: string; url: string; expiresOn: string };
+  };
+  getLogUploadUrl: {
+    input: { name: string };
+    output: { url: string; expiresOn: string };
   };
 };
