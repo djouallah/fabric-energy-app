@@ -19,7 +19,7 @@ const udf = new UserDataFunctions();
  * The data workspace must allow "Authenticate with OneLake user-delegated SAS tokens".
  */
 
-type Ctx = RayfinContext<BlankAppSchema, AudienceType.Storage>;
+type StorageCtx = RayfinContext<BlankAppSchema, AudienceType.Storage>;
 
 const SAS_VERSION = '2022-11-02';
 const SAS_LIFETIME_MS = 15 * 60 * 1000;   // OneLake caps SAS and delegation keys at 1 hour
@@ -33,7 +33,7 @@ interface DelegationKey {
 
 const iso = (d: Date): string => d.toISOString().replace(/\.\d{3}Z$/, 'Z');
 
-function filesBase(ctx: Ctx): URL {
+function filesBase(ctx: StorageCtx): URL {
   return new URL(ctx.Secrets.ONELAKE_FILES_URL.replace(/\/+$/, ''));
 }
 
@@ -89,7 +89,7 @@ function signFileSas(base: URL, relPath: string, permissions: string, key: Deleg
 /** Read-only SAS URL for the current dashboard database (resolved from data/latest.txt). */
 udf.func(
   'getDataUrl',
-  async (ctx: Ctx): Promise<{ file: string; url: string; expiresOn: string }> => {
+  async (ctx: RayfinContext<BlankAppSchema, AudienceType.Storage>): Promise<{ file: string; url: string; expiresOn: string }> => {
     const token = ctx.Tokens.Storage;
     const base = filesBase(ctx);
     const latest = await fetch(`${base}/data/latest.txt`, { headers: { Authorization: `Bearer ${token}` } });
@@ -105,7 +105,7 @@ udf.func(
 /** Create/overwrite SAS URL (Blob endpoint) for one query-log CSV under query_logs/data/. */
 udf.func(
   'getLogUploadUrl',
-  async (name: string, ctx: Ctx): Promise<{ url: string; expiresOn: string }> => {
+  async (name: string, ctx: RayfinContext<BlankAppSchema, AudienceType.Storage>): Promise<{ url: string; expiresOn: string }> => {
     if (!LOG_NAME.test(name)) throw new Error('invalid query-log file name');
     const token = ctx.Tokens.Storage;
     const base = filesBase(ctx);
