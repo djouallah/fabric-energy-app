@@ -99,12 +99,24 @@
     // opts.noCache: skip the result cache. Required for the render path — base scans write a
     // mutable TEMP TABLE and the chart queries over it have filter-invariant SQL, so a cached
     // result keyed on that constant string would survive a filter change and serve stale rows.
+    // Remote-attached data (rayfin): make sure the SAS in the attached URL is current, and on a
+    // failed read (HTTP 403 = expired SAS) re-attach once and retry.
+    async function queryDb(c, sqlStr) {
+      await data.ensureFresh();
+      try { return await c.query(sqlStr); }
+      catch (e) {
+        if (!/\b403\b|HTTP/i.test(String(e?.message))) throw e;
+        await data.ensureFresh(true);
+        return c.query(sqlStr);
+      }
+    }
+
     async function runQuery(sqlStr, opts = {}) {
       if (!opts.noCache) {
         const cached = _queryCache.get(sqlStr);
         if (cached) return cached;
       }
-      const result = await conn.query(sqlStr);
+      const result = await queryDb(conn, sqlStr);
       const numRows = Number(result.numRows);
       const fields = result.schema.fields;
       const columns = fields.map(f => {
@@ -194,6 +206,7 @@
     async function downloadCSVDirect(sqlStr, filename) {
       const exportConn = await _db.connect();
       try {
+        await data.ensureFresh();
         const reader = await exportConn.send(sqlStr);
         const chunks = [];
         let headerWritten = false;

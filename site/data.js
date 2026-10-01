@@ -4,8 +4,10 @@
 // Platform-agnostic data loading. Given an AuthProvider (auth.js) and config, it:
 //   1. instantiates DuckDB-WASM,
 //   2. resolves the latest .duckdb file (OneLake `latest.txt` pointer, if any),
-//   3. fetches + OPFS-caches it (conditional GET via ETag),
-//   4. ATTACHes it as `db` (READ_ONLY).
+//   3. rayfin: ATTACHes the OneLake file in place over HTTP — DuckDB reads only the blocks a query
+//      touches (Range requests); nothing is downloaded up front.
+//      otherwise: fetches + OPFS-caches it (conditional GET via ETag) and ATTACHes the local copy.
+//   The attachment is always schema `db` (READ_ONLY).
 //
 // Where the file comes from:
 //   auth.dataAccess present (rayfin) -> OneLake data/ folder + a read-only SAS from the backend.
@@ -24,6 +26,7 @@ import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.32.0
 export function createDataSource(cfg = {}, auth, { onStatus = () => {} } = {}) {
   const baseUrl = cfg.dataBaseUrl ?? cfg.oneLakeBase ?? '';
   const signed = typeof auth.dataAccess === 'function';
+  const REATTACH_MARGIN_MS = 2 * 60 * 1000;   // re-attach with a fresh SAS this long before expiry
   // An expired/invalid token is a 401; an expired SAS is a 403.
   const authFailed = (resp) => resp.status === 401 || resp.status === 403;
 
@@ -121,6 +124,34 @@ export function createDataSource(cfg = {}, auth, { onStatus = () => {} } = {}) {
     }
   }
 
+  // Remote attach (rayfin): the SAS is part of the file URL, so before it expires the file is
+  // re-registered under a new name with a fresh SAS and re-ATTACHed (metadata re-read, ~1/hour).
+  let _remote = null;        // { db, conn, file, name, n, expiresAt }
+  let _reattaching = null;
+
+  async function attachRemote(db, conn, file, n = 0) {
+    const { baseUrl: dir, sas, expiresOn } = await auth.dataAccess();
+    const name = `r${n}_${file}`;
+    await db.registerFileURL(name, `${dir}/${file}?${sas}`, duckdb.DuckDBDataProtocol.HTTP, false);
+    await conn.query(`ATTACH '${name}' AS db (READ_ONLY);`);
+    const old = _remote?.name;
+    _remote = { db, conn, file, name, n, expiresAt: Date.parse(expiresOn) };
+    if (old) await db.dropFile(old).catch(() => {});
+  }
+
+  // Re-attach with a fresh SAS. `force` after a failed read (e.g. 403); otherwise only when the
+  // current SAS is about to expire. Concurrent callers share one re-attach.
+  function ensureFresh(force = false) {
+    if (!_remote || (!force && Date.now() < _remote.expiresAt - REATTACH_MARGIN_MS)) return Promise.resolve();
+    _reattaching ??= (async () => {
+      const { db, conn, file, n } = _remote;
+      if (force) await auth.refresh();
+      await conn.query('DETACH db;');
+      await attachRemote(db, conn, file, n + 1);
+    })().finally(() => { _reattaching = null; });
+    return _reattaching;
+  }
+
   async function init() {
     onStatus("Loading DuckDB WASM...");
     const JSDELIVR_BUNDLES = duckdb.getJsDelivrBundles();
@@ -139,19 +170,24 @@ export function createDataSource(cfg = {}, auth, { onStatus = () => {} } = {}) {
     // No fallback to a bundled copy: if OneLake is unreachable the dashboard must say so, not
     // silently show stale demo data.
     const dbFile = await resolveLatestDuckDB();
-    const remote = signed || !!baseUrl;
-    const url = remote ? await dataUrl(dbFile) : './data/data.duckdb';
-    const dbResult = await cacheInOPFS(db, url, dbFile, signed ? () => dataUrl(dbFile) : undefined);
-    await evictOldDuckDBs(dbFile);
-    await conn.query(`ATTACH '${dbFile}' AS db (READ_ONLY);`);
+    if (signed) {
+      onStatus("Opening database...");
+      await attachRemote(db, conn, dbFile);
+      await evictOldDuckDBs(null);   // free the full copies earlier versions kept in OPFS
+      console.log(`[data] ${dbFile}: attached remotely (HTTP range reads)`);
+    } else {
+      const url = baseUrl ? await dataUrl(dbFile) : './data/data.duckdb';
+      const dbResult = await cacheInOPFS(db, url, dbFile);
+      await evictOldDuckDBs(dbFile);
+      await conn.query(`ATTACH '${dbFile}' AS db (READ_ONLY);`);
+      const sourceLabel = { 'opfs-hit': 'cached', 'opfs-miss': 'downloaded', 'opfs-refresh': 'refreshed' };
+      console.log(`[OPFS] ${dbFile}: ${sourceLabel[dbResult.source]}`);
+    }
     await conn.query("SET preserve_insertion_order = false;");
-
-    const sourceLabel = { 'opfs-hit': 'cached', 'opfs-miss': 'downloaded', 'opfs-refresh': 'refreshed' };
-    console.log(`[OPFS] ${dbFile}: ${sourceLabel[dbResult.source]}`);
     console.log(`[DuckDB] crossOriginIsolated: ${window.crossOriginIsolated} (${window.crossOriginIsolated ? 'multi-threaded' : 'single-threaded'})`);
 
     return { db, conn };
   }
 
-  return { init };
+  return { init, ensureFresh };
 }
