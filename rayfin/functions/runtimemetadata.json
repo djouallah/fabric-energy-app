@@ -2,7 +2,7 @@
   "schemaVersion": "2.0",
   "functions": [
     {
-      "functionName": "getDataUrl",
+      "functionName": "getDataSas",
       "delegateParameters": [
         {
           "name": "ctx",

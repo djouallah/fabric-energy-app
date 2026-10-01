@@ -8,7 +8,7 @@
 //   4. ATTACHes it as `db` (READ_ONLY).
 //
 // Where the file comes from:
-//   auth.signedDataUrl present (rayfin) -> a single-file OneLake SAS URL from the backend.
+//   auth.dataAccess present (rayfin) -> OneLake data/ folder + a read-only SAS from the backend.
 //   else cfg.dataBaseUrl ?? cfg.oneLakeBase ?? '':
 //     non-empty -> fetch `<base>/data/<file>.duckdb` with auth headers.
 //     ''        -> same-origin `./data/data.duckdb`, no auth (bundled / public static host).
@@ -23,7 +23,7 @@ import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.32.0
 
 export function createDataSource(cfg = {}, auth, { onStatus = () => {} } = {}) {
   const baseUrl = cfg.dataBaseUrl ?? cfg.oneLakeBase ?? '';
-  const signed = typeof auth.signedDataUrl === 'function';
+  const signed = typeof auth.dataAccess === 'function';
   // An expired/invalid token is a 401; an expired SAS is a 403.
   const authFailed = (resp) => resp.status === 401 || resp.status === 403;
 
@@ -85,16 +85,23 @@ export function createDataSource(cfg = {}, auth, { onStatus = () => {} } = {}) {
     return { source: cachedEtag ? 'opfs-refresh' : 'opfs-miss' };
   }
 
+  // URL of a file in the data folder: SAS-signed (rayfin) or `<baseUrl>/data/<name>` + auth headers.
+  async function dataUrl(name) {
+    if (!signed) return `${baseUrl}/data/${name}`;
+    const { baseUrl: dir, sas } = await auth.dataAccess();
+    return `${dir}/${name}?${sas}`;
+  }
+
   // Resolve the moving `latest.txt` pointer to a concrete db filename. Same-origin
   // (no baseUrl) has no pointer — always 'data.duckdb'.
   async function resolveLatestDuckDB() {
-    if (!baseUrl) return 'data.duckdb';
+    if (!signed && !baseUrl) return 'data.duckdb';
     try {
       // no-store: latest.txt is a moving pointer; a cached copy would resolve to a stale db
       // filename and the dashboard would never pick up a fresh import.
-      const fetchLatest = () => fetch(`${baseUrl}/data/latest.txt`, { headers: auth.getHeaders(), cache: 'no-store' });
+      const fetchLatest = async () => fetch(await dataUrl('latest.txt'), { headers: auth.getHeaders(), cache: 'no-store' });
       let resp = await fetchLatest();
-      if (resp.status === 401) { await auth.refresh(); resp = await fetchLatest(); }
+      if (authFailed(resp)) { await auth.refresh(); resp = await fetchLatest(); }
       if (!resp.ok) return 'data.duckdb';
       const fname = (await resp.text()).trim();
       console.log(`[data] latest db: ${fname}`);
@@ -131,15 +138,10 @@ export function createDataSource(cfg = {}, auth, { onStatus = () => {} } = {}) {
 
     // No fallback to a bundled copy: if OneLake is unreachable the dashboard must say so, not
     // silently show stale demo data.
-    let dbFile, url, renewUrl;
-    if (signed) {
-      ({ file: dbFile, url } = await auth.signedDataUrl());
-      renewUrl = async () => (await auth.signedDataUrl()).url;
-    } else {
-      dbFile = await resolveLatestDuckDB();
-      url = baseUrl ? `${baseUrl}/data/${dbFile}` : './data/data.duckdb';
-    }
-    const dbResult = await cacheInOPFS(db, url, dbFile, renewUrl);
+    const dbFile = await resolveLatestDuckDB();
+    const remote = signed || !!baseUrl;
+    const url = remote ? await dataUrl(dbFile) : './data/data.duckdb';
+    const dbResult = await cacheInOPFS(db, url, dbFile, signed ? () => dataUrl(dbFile) : undefined);
     await evictOldDuckDBs(dbFile);
     await conn.query(`ATTACH '${dbFile}' AS db (READ_ONLY);`);
     await conn.query("SET preserve_insertion_order = false;");

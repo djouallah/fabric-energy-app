@@ -2,14 +2,14 @@
 // auth.js — AuthProvider abstraction (presentation/data agnostic)
 // =============================================================================
 // One interface, two implementations selected by config:
-//   'rayfin' -> Rayfin Fabric SSO + functions that return single-file OneLake SAS URLs (default)
+//   'rayfin' -> Rayfin Fabric SSO (or anonymous) + functions that return scoped OneLake SAS (default)
 //   'none'   -> no auth at all (plain static hosting, same-origin/public data)
 //
 // DOM-free: the dashboard (app.js) owns all UI, including the sign-in gate.
 //
 //   const auth = createAuth(cfg);
 //   if (await auth.ensureSession(false)) { /* signed in */ }
-//   auth.signedDataUrl?.()  -> { file, url }   (rayfin only; data.js uses it when present)
+//   auth.dataAccess?.()  -> { baseUrl, sas }   (rayfin only; data.js uses it when present)
 //   auth.signedUploadUrl?.(relPath) -> url
 // =============================================================================
 
@@ -30,16 +30,25 @@ function createNoAuth() {
 }
 
 // --- Rayfin provider: Fabric SSO session (no second login; inside the Fabric portal iframe the
-// session is handed over by postMessage). The browser never holds a storage token: the getDataUrl /
-// getLogUploadUrl functions (rayfin/functions) sign OneLake SAS URLs for one file each, read-only
-// for the database, create/write for a query-log CSV, ~15 min. Backend URL, key and Fabric
-// coordinates come from the rayfin.config.json that `rayfin up` writes next to the site.
+// session is handed over by postMessage), or no session at all when the app allows anonymous
+// access. The browser never holds a storage token: the getDataSas / getLogUploadUrl functions
+// (rayfin/functions) sign OneLake SAS — read-only on the data/ folder, create/write on one
+// query-log CSV — valid ~55 min. Both are cached (the data SAS across reloads, in localStorage) so
+// a visitor calls the functions about once an hour. Backend URL, key and Fabric coordinates come
+// from the rayfin.config.json that `rayfin up` writes next to the site.
 function createRayfinAuth() {
-  const RENEW_MARGIN_MS = 2 * 60 * 1000;   // re-sign this long before a SAS expires
+  const RENEW_MARGIN_MS = 3 * 60 * 1000;   // re-sign this long before a SAS expires
+  const DATA_SAS_KEY = 'rayfin_data_sas';
   let _client = null;
   let _fabric = null;
   let _fabricOpts = null;
-  let _data = null;                        // cached { file, url, expiresOn } from getDataUrl
+  let _data = load();                      // { baseUrl, sas, expiresOn } from getDataSas
+  const _uploads = new Map();              // relPath -> { url, expiresOn } from getLogUploadUrl
+
+  // localStorage can be unavailable (private mode, blocked storage): the cache is best-effort.
+  function load() { try { return JSON.parse(localStorage.getItem(DATA_SAS_KEY)); } catch (e) { return null; } }
+  function save(v) { try { v ? localStorage.setItem(DATA_SAS_KEY, JSON.stringify(v)) : localStorage.removeItem(DATA_SAS_KEY); } catch (e) {} }
+  const fresh = (signed) => !!signed && Date.now() < Date.parse(signed.expiresOn) - RENEW_MARGIN_MS;
 
   async function init() {
     if (_client) return;
@@ -58,18 +67,25 @@ function createRayfinAuth() {
     _fabric = fabric;
   }
 
-  // Silent: stored session / refresh token / Fabric iframe handoff. Interactive (button click)
-  // adds the Fabric popup for a standalone tab.
-  async function ensureSession(interactive) {
+  async function dataAccess() {
+    if (fresh(_data)) return _data;
     await init();
-    if (_client.auth.getSession()?.isAuthenticated) return true;
-    const session = interactive
-      ? await _fabric.ensureSignedInWithFabric(_client.auth, _fabricOpts)
-      : await _fabric.initEmbeddedAuth(_client.auth, _fabricOpts);
-    return !!session?.isAuthenticated;
+    _data = await _client.functions.getDataSas.invoke();
+    save(_data);
+    return _data;
   }
 
-  const fresh = (signed) => signed && Date.now() < Date.parse(signed.expiresOn) - RENEW_MARGIN_MS;
+  // Silent: cached data SAS / stored session / refresh token / Fabric iframe handoff / anonymous
+  // call. Interactive (button click) adds the Fabric popup for a standalone tab.
+  async function ensureSession(interactive) {
+    if (!interactive && fresh(_data)) return true;
+    await init();
+    if (_client.auth.getSession()?.isAuthenticated) return true;
+    if (interactive) return !!(await _fabric.ensureSignedInWithFabric(_client.auth, _fabricOpts))?.isAuthenticated;
+    if ((await _fabric.initEmbeddedAuth(_client.auth, _fabricOpts))?.isAuthenticated) return true;
+    try { await dataAccess(); return true; }   // app allows anonymous calls
+    catch (e) { return false; }
+  }
 
   return {
     mode: 'rayfin',
@@ -79,19 +95,24 @@ function createRayfinAuth() {
       const u = _client && _client.auth.getSession()?.user;
       return (u && (u.email || u.id)) || null;
     },
-    async signedDataUrl() {
-      if (!fresh(_data)) _data = await _client.functions.getDataUrl.invoke();
-      return _data;
-    },
+    dataAccess,
     async signedUploadUrl(relPath) {
       const m = String(relPath).match(/^query_logs\/data\/([^/]+)$/);
       if (!m) throw new Error(`no signed upload for ${relPath}`);
-      return (await _client.functions.getLogUploadUrl.invoke({ name: m[1] })).url;
+      let signed = _uploads.get(relPath);
+      if (!fresh(signed)) {
+        await init();
+        signed = await _client.functions.getLogUploadUrl.invoke({ name: m[1] });
+        _uploads.set(relPath, signed);
+      }
+      return signed.url;
     },
-    // Drop cached SAS URLs (e.g. after a 403) so the next call re-signs.
+    // Drop cached SAS (e.g. after a 403) so the next call re-signs.
     async refresh() {
       _data = null;
-      try { return await ensureSession(false); } catch (e) { return false; }
+      save(null);
+      _uploads.clear();
+      return true;
     },
   };
 }

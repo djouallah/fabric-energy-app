@@ -17,9 +17,9 @@
  */
 
 export type AppFunctionsSchema = {
-  getDataUrl: {
+  getDataSas: {
     input: Record<string, never>;
-    output: { file: string; url: string; expiresOn: string };
+    output: { baseUrl: string; sas: string; expiresOn: string };
   };
   getLogUploadUrl: {
     input: { name: string };

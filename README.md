@@ -26,14 +26,15 @@ from the app's own origin.
 - **Auth:** the browser signs in with **Rayfin's Fabric SSO** (no extra login; inside the Fabric portal
   iframe the session is handed over by `postMessage`) and calls Rayfin Functions
   (`rayfin/functions/src/function_app.ts`). They hold the app identity's OneLake token **server-side** and
-  return a **OneLake user-delegation SAS URL for exactly one file**, ~15 min: read-only for the current
-  `.duckdb` (`getDataUrl`, which also resolves `data/latest.txt`), create/write for one query-log CSV
-  (`getLogUploadUrl`). The browser never holds a storage token. Plain HTTPS fetch — no `azure` extension.
+  return OneLake **user-delegation SAS** tokens: read-only on the `data/` folder (`getDataSas`), and
+  create/write on one query-log CSV (`getLogUploadUrl`). The browser never holds a storage token. SAS
+  last ~55 min and are cached (the data SAS in localStorage across reloads), so a visitor calls the
+  functions about once an hour. Plain HTTPS fetch — no `azure` DuckDB extension.
 
 ```
-browser (DuckDB-WASM)  ──fetch <file>?<SAS>──►  OneLake (one data_*.duckdb, read-only)
+browser (DuckDB-WASM)  ──fetch data/<file>?<SAS>──►  OneLake (data/ folder, read-only)
         ▲
-        └── Rayfin Fabric SSO → getDataUrl function (app identity token stays here) → single-file SAS
+        └── Rayfin Fabric SSO → getDataSas function (app identity token stays here) → folder SAS
 ```
 
 ## Setup
@@ -63,9 +64,8 @@ Open it inside the Fabric portal or in its own tab (one Fabric sign-in click the
 
 ## limitations
 
-- **Users see the SAS URLs** (DevTools), but each one opens a single file with a single permission for
-  ~15 min: the dashboard DB read-only, or one query-log CSV create/write. Anyone who can open the app
-  can therefore read that DB — which is the point of the app. Per-user OneLake permissions don't apply.
+- **Users see the SAS** (DevTools): read-only on `data/` (keep only public data there) or create/write
+  on one query-log CSV, ~55 min. Per-user OneLake permissions don't apply.
 - **Single-threaded** DuckDB-WASM in `rayfin` mode. Multi-threading needs cross-origin isolation
   (COOP/COEP): the Fabric portal iframe can never be isolated, and COOP severs the Fabric sign-in popup.
 - No data is committed here; it lives in your OneLake. No secrets are committed.
