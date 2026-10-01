@@ -16,6 +16,7 @@ services:
     folder: dist
     buildCommand: npm run build:fabric
     indexDocument: index.html
+    assetAccess: protected
   storage:
     enabled: false
   functions:
