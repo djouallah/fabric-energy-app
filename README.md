@@ -61,18 +61,3 @@ rayfin up         # build (build.mjs) + deploy dist/ to Fabric static hosting; p
 to `<oneLakeBase>/data/data.duckdb` in the lakehouse (the dashboard fetches it from exactly that path).
 Open it inside the Fabric portal or in its own tab (one Fabric sign-in click there).
 
-## limitations
-
-- **Users see the SAS** (DevTools): read-only on `data/` for ~55 min — keep only public data there.
-  Per-user OneLake permissions don't apply.
-- **Single-threaded** DuckDB-WASM in `rayfin` mode. Multi-threading needs cross-origin isolation
-  (COOP/COEP): the Fabric portal iframe can never be isolated, and COOP severs the Fabric sign-in popup.
-- No data is committed here; it lives in your OneLake. No secrets are committed.
-- **File format:** we use DuckDB's native `.duckdb` format for performance. Parquet files over HTTPS are also supported by DuckDB-WASM, and Iceberg is supported too — but the `azure` extension's `abfss://` scheme does not work in WASM, so OneLake access goes through plain HTTPS fetch with a Bearer token (as done here) rather than native Azure filesystem URIs.
-- Want it without a sign-in? Set `oneLakeBase: ""` in `config.js` and put `data.duckdb` at `site/data/data.duckdb`
-  so it's served same-origin (no token needed). Handy for a quick local check of query changes — but don't
-  commit it (`*.duckdb` is gitignored).
-
-## Why Rayfin and not GitHub Pages?
-
-GitHub Pages is free and would serve the static files just fine — but then the data has to be public too. Rayfin gives you **Fabric sign-in out of the box**, plus a server-side function to hold the OneLake credential: the page files are served publicly (`assetAccess: public` — they contain no data or secrets), but the data only reaches people with access to the Fabric item, via a short-lived read-only SAS. No extra infrastructure, no Azure AD App Proxy, no custom auth middleware.
