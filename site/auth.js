@@ -2,7 +2,7 @@
 // auth.js — AuthProvider abstraction (presentation/data agnostic)
 // =============================================================================
 // One interface, two implementations selected by config:
-//   'rayfin' -> Rayfin Fabric SSO (or anonymous) + functions that return scoped OneLake SAS (default)
+//   'rayfin' -> Rayfin Fabric SSO + a function that returns a scoped OneLake SAS (default)
 //   'none'   -> no auth at all (plain static hosting, same-origin/public data)
 //
 // DOM-free: the dashboard (app.js) owns all UI, including the sign-in gate.
@@ -28,8 +28,7 @@ function createNoAuth() {
 }
 
 // --- Rayfin provider: Fabric SSO session (no second login; inside the Fabric portal iframe the
-// session is handed over by postMessage), or no session at all when the app allows anonymous
-// access. The browser never holds a storage token: the getDataSas function (rayfin/functions)
+// session is handed over by postMessage). The browser never holds a storage token: the getDataSas function (rayfin/functions)
 // signs a read-only OneLake SAS on the data/ folder, valid ~55 min and cached in localStorage
 // across reloads, so a visitor calls the function about once an hour. Backend URL, key and Fabric coordinates come
 // from the rayfin.config.json that `rayfin up` writes next to the site.
@@ -71,16 +70,14 @@ function createRayfinAuth() {
     return _data;
   }
 
-  // Silent: cached data SAS / stored session / refresh token / Fabric iframe handoff / anonymous
-  // call. Interactive (button click) adds the Fabric popup for a standalone tab.
+  // Silent: cached data SAS / stored session / refresh token / Fabric iframe handoff.
+  // Interactive (button click) adds the Fabric popup for a standalone tab.
   async function ensureSession(interactive) {
     if (!interactive && fresh(_data)) return true;
     await init();
     if (_client.auth.getSession()?.isAuthenticated) return true;
     if (interactive) return !!(await _fabric.ensureSignedInWithFabric(_client.auth, _fabricOpts))?.isAuthenticated;
-    if ((await _fabric.initEmbeddedAuth(_client.auth, _fabricOpts))?.isAuthenticated) return true;
-    try { await dataAccess(); return true; }   // app allows anonymous calls
-    catch (e) { return false; }
+    return !!(await _fabric.initEmbeddedAuth(_client.auth, _fabricOpts))?.isAuthenticated;
   }
 
   return {

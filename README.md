@@ -75,4 +75,4 @@ Open it inside the Fabric portal or in its own tab (one Fabric sign-in click the
 
 ## Why Rayfin and not GitHub Pages?
 
-GitHub Pages is free and would serve the static files just fine — but it's public. Anyone on the internet can reach it. Rayfin gives you **Entra authentication out of the box**: only users in your tenant can open the app at all, with no extra infrastructure, no Azure AD App Proxy, and no custom auth middleware. One `rayfin up` and the app is tenant-gated.
+GitHub Pages is free and would serve the static files just fine — but then the data has to be public too. Rayfin gives you **Fabric sign-in out of the box**, plus a server-side function to hold the OneLake credential: the page files are served publicly (`assetAccess: public` — they contain no data or secrets), but the data only reaches people with access to the Fabric item, via a short-lived read-only SAS. No extra infrastructure, no Azure AD App Proxy, no custom auth middleware.
