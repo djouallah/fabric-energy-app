@@ -5,13 +5,11 @@
 // dashboard can be published to different platforms by shipping a different config.js.
 // For a no-auth static deploy (GitHub Pages, S3, bundled data) start from config.static.example.js.
 window.RAYFIN_WASM_CONFIG = {
-  // 'msal' = Entra ID sign-in + OneLake bearer token. 'none' = no auth (public/same-origin data).
-  // If omitted, inferred: 'msal' when clientId+tenantId are set, otherwise 'none'.
-  auth: "msal",
-
-  // Entra ID SPA app registration (public client, PKCE — no secret). See README "Setup". (msal only)
-  clientId: "<your-entra-spa-app-client-id>",
-  tenantId: "<your-entra-tenant-id>",
+  // 'rayfin' (default) = Rayfin Fabric SSO; the getStorageToken function (rayfin/functions) returns
+  //   the OneLake bearer token as the app identity. No extra login, works in the Fabric iframe.
+  //   Needs no ids here — they come from the rayfin.config.json written by `rayfin up`.
+  // 'none' = no auth (public/same-origin data).
+  auth: "rayfin",
 
   // Base URL where the data lives, of the form:
   //   https://onelake.dfs.fabric.microsoft.com/<workspace>/<lakehouse>.Lakehouse/Files

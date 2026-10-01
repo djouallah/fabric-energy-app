@@ -4,11 +4,18 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Australian Energy Dashboard</title>
-  <script src="coi-serviceworker.js"></script>
   <script src="config.js"></script>
+  <script>
+    // Rayfin auth runs inside the Fabric portal iframe (which can never be cross-origin isolated)
+    // and signs standalone tabs in through a Fabric popup (which COOP: same-origin severs), so only
+    // the no-auth static build uses the COOP/COEP service worker for multi-threaded DuckDB.
+    if ((window.RAYFIN_WASM_CONFIG || {}).auth !== 'none') {
+      window.coi = { shouldRegister: () => false, shouldDeregister: () => true };
+    }
+  </script>
+  <script src="coi-serviceworker.js"></script>
   <link rel="preconnect" href="https://cdn.jsdelivr.net">
   <link rel="preconnect" href="https://onelake.dfs.fabric.microsoft.com" crossorigin>
-  <link rel="preconnect" href="https://login.microsoftonline.com">
   <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }

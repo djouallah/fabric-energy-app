@@ -1,15 +1,23 @@
 {
-  "extends": "../tsconfig.json",
   "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "ESNext.Decorators"],
     "outDir": ".temp/compiled",
     "rootDir": ".",
     "declaration": true,
     "composite": true,
     "noEmit": false,
-    "allowImportingTsExtensions": false,
     "module": "nodenext",
-    "moduleResolution": "nodenext"
+    "moduleResolution": "nodenext",
+    "strictNullChecks": true,
+    "skipLibCheck": true,
+    "types": []
   },
-  "include": ["**/*"],
-  "exclude": [".temp/**/*"]
+  "include": [
+    "**/*"
+  ],
+  "exclude": [
+    ".temp/**/*",
+    "functions/**/*"
+  ]
 }

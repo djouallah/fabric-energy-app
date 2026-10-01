@@ -9,6 +9,6 @@
     "rayfin:up": "rayfin up"
   },
   "devDependencies": {
-    "@microsoft/rayfin-cli": "^1.33.1"
+    "@microsoft/rayfin-cli": "^1.36.1"
   }
 }

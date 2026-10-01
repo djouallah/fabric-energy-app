@@ -2,20 +2,22 @@
 // auth.js — AuthProvider abstraction (presentation/data agnostic)
 // =============================================================================
 // One interface, two implementations selected by config:
-//   'msal' -> Entra ID SPA public client (PKCE), bearer token for OneLake
-//   'none' -> no auth at all (plain static hosting, same-origin/public data)
+//   'rayfin' -> Rayfin Fabric SSO + the getStorageToken function, bearer token for OneLake (default)
+//   'none'   -> no auth at all (plain static hosting, same-origin/public data)
 //
 // DOM-free: progress is reported through the injected `onStatus` callback so this
 // module never touches the page. The dashboard (app.js) owns all UI, including the
-// sign-in / "open in tab" gate — it just calls ensureSession()/getHeaders() here.
+// sign-in gate — it just calls ensureSession()/getHeaders() here.
 //
 //   const auth = createAuth(cfg, { onStatus });
 //   if (await auth.ensureSession(false)) { /* have what we need to fetch data */ }
 //   fetch(url, { headers: auth.getHeaders() });
 // =============================================================================
 
-const MSAL_ESM = "https://cdn.jsdelivr.net/npm/@azure/msal-browser@3.28.1/+esm";
-const OL_SCOPES = ['https://storage.azure.com/user_impersonation'];
+// Keep these on the same version: jsDelivr resolves their shared deps (rayfin-auth, rayfin-lib)
+// to the same module URLs, so the provider operates on the client's own Auth instance.
+const RAYFIN_CLIENT_ESM = "https://cdn.jsdelivr.net/npm/@microsoft/rayfin-client@1.36.1/+esm";
+const RAYFIN_FABRIC_ESM = "https://cdn.jsdelivr.net/npm/@microsoft/rayfin-auth-provider-fabric@1.36.1/+esm";
 
 // --- No-auth provider: everything is already accessible. ---
 function createNoAuth() {
@@ -28,93 +30,86 @@ function createNoAuth() {
   };
 }
 
-// --- MSAL provider: Entra SPA public client, OneLake bearer token. ---
-// REDIRECT auth (not popup): the coi-serviceworker sets COOP: same-origin to get
-// crossOriginIsolated for DuckDB multi-threading, which severs the popup<->opener link once the
-// popup bounces through login.microsoftonline.com — so loginPopup can't return the token after the
-// session expires. A full-page redirect is COOP-safe. Redirect throws "redirect_in_iframe" inside
-// the Fabric portal iframe, but we never auth there (app.js shows "open in tab" instead).
-function createMsalAuth(cfg) {
-  const MSAL_CONFIG = {
-    auth: {
-      clientId: cfg.clientId,
-      authority: `https://login.microsoftonline.com/${cfg.tenantId}`,
-      redirectUri: window.location.origin,
-    },
-    cache: { cacheLocation: 'localStorage' },
-  };
-
-  let _msalApp = null;
+// --- Rayfin provider: Fabric SSO session, then the getStorageToken function (rayfin/functions)
+// returns a OneLake bearer token issued to the app identity. No second login, and the session is
+// handed over by postMessage, so it works inside the Fabric portal iframe. Backend URL, key and
+// Fabric coordinates come from the rayfin.config.json that `rayfin up` writes next to the site.
+function createRayfinAuth() {
+  const REFRESH_MARGIN_MS = 5 * 60 * 1000;   // refetch the storage token this long before expiry
+  let _client = null;
+  let _fabric = null;
+  let _fabricOpts = null;
   let _token = null;
+  let _exp = 0;
+  let _timer = null;
 
-  // Lazy-load msal-browser only when this provider is actually used, so a no-auth
-  // deploy never fetches it.
-  async function initMsal() {
-    if (_msalApp) return;
-    const msal = await import(MSAL_ESM);
-    _msalApp = new msal.PublicClientApplication(MSAL_CONFIG);
-    await _msalApp.initialize();
-    // Process a redirect response if we're returning from acquireTokenRedirect.
-    const resp = await _msalApp.handleRedirectPromise();
-    if (resp && resp.account) {
-      _msalApp.setActiveAccount(resp.account);
-      _token = resp.accessToken;
-    }
-    const acct = _msalApp.getActiveAccount() || _msalApp.getAllAccounts()[0];
-    if (acct) _msalApp.setActiveAccount(acct);
+  async function init() {
+    if (_client) return;
+    const [{ RayfinClient, resolveRayfinConfig }, fabric] =
+      await Promise.all([import(RAYFIN_CLIENT_ESM), import(RAYFIN_FABRIC_ESM)]);
+    const resolved = await resolveRayfinConfig({});
+    if (!resolved.baseUrl) throw new Error('rayfin.config.json not found — deploy with `rayfin up`');
+    _client = new RayfinClient({ ...resolved, authStorage: true });
+    const rc = _client.runtimeConfig || {};
+    _fabricOpts = {
+      workspaceId: rc.workspaceId,
+      projectId: rc.itemId,
+      fabricPortalUrl: rc.portalUrl,
+      returnOrigin: window.location.origin,
+    };
+    _fabric = fabric;
   }
 
-  // Acquire a OneLake token. interactive=true navigates the whole tab to Microsoft and back.
-  // Returns true if we now hold a token, false if interactive sign-in is still needed (or has
-  // been kicked off — acquireTokenRedirect navigates away and never resolves).
-  async function acquire(interactive) {
-    await initMsal();
-    if (_token) return true;   // already set by handleRedirectPromise
-    const account = _msalApp.getActiveAccount();
-    if (account) {
-      try {
-        _token = (await _msalApp.acquireTokenSilent({ scopes: OL_SCOPES, account })).accessToken;
-        return true;
-      } catch (e) { /* fall through */ }
-    }
+  // JWT `exp` (seconds) -> ms; 0 if unreadable, which just means "refetch on the next 401".
+  function jwtExpiry(token) {
     try {
-      const r = await _msalApp.ssoSilent({ scopes: OL_SCOPES });
-      _msalApp.setActiveAccount(r.account);
-      _token = r.accessToken;
-      return true;
-    } catch (e) { /* no usable session -> need interaction */ }
-    if (!interactive) return false;
-    await _msalApp.acquireTokenRedirect({ scopes: OL_SCOPES });   // navigates away
-    return false;
+      const b64 = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+      return JSON.parse(atob(b64)).exp * 1000 || 0;
+    } catch (e) { return 0; }
+  }
+
+  async function fetchToken() {
+    const { token } = await _client.functions.getStorageToken.invoke();
+    _token = token;
+    _exp = jwtExpiry(token);
+    // Refresh ahead of expiry so long-lived tabs (and query-log writes) don't hit a 401 first.
+    clearTimeout(_timer);
+    if (_exp) _timer = setTimeout(() => fetchToken().catch(e => console.warn('[auth] token refresh failed:', e)),
+                                  Math.max(_exp - Date.now() - REFRESH_MARGIN_MS, 60 * 1000));
+  }
+
+  // Silent: stored session / refresh token / Fabric iframe handoff. Interactive (button click)
+  // adds the Fabric popup for a standalone tab.
+  async function acquire(interactive) {
+    await init();
+    if (_token && (!_exp || Date.now() < _exp - REFRESH_MARGIN_MS)) return true;
+    if (!_client.auth.getSession()?.isAuthenticated) {
+      const session = interactive
+        ? await _fabric.ensureSignedInWithFabric(_client.auth, _fabricOpts)
+        : await _fabric.initEmbeddedAuth(_client.auth, _fabricOpts);
+      if (!session?.isAuthenticated) return false;
+    }
+    await fetchToken();
+    return true;
   }
 
   return {
-    mode: 'msal',
+    mode: 'rayfin',
     ensureSession(interactive) { return acquire(interactive); },
     getHeaders() { return _token ? { Authorization: 'Bearer ' + _token } : {}; },
-    // Signed-in identity for telemetry/logging — UPN (e.g. user@tenant), falling back to the
-    // stable homeAccountId, or null before sign-in.
     getUserId() {
-      const a = _msalApp && _msalApp.getActiveAccount();
-      return (a && (a.username || a.homeAccountId)) || null;
+      const u = _client && _client.auth.getSession()?.user;
+      return (u && (u.email || u.id)) || null;
     },
     async refresh() {
+      _token = null;
       try { return await acquire(false); } catch (e) { return false; }
     },
-    // Let the data layer drop a stale token before falling back to local data.
     _clearToken() { _token = null; },
   };
 }
 
-// Pick the provider. Explicit cfg.auth wins; otherwise infer from whether MSAL
-// identifiers are present (keeps old configs working without an `auth` field).
-export function createAuth(cfg = {}, { onStatus } = {}) {
-  const mode = cfg.auth || ((cfg.clientId && cfg.tenantId) ? 'msal' : 'none');
-  if (mode === 'msal') {
-    if (!cfg.clientId || !cfg.tenantId) {
-      console.warn('[auth] msal mode but clientId/tenantId missing in config.js');
-    }
-    return createMsalAuth(cfg);
-  }
-  return createNoAuth();
+// Pick the provider: 'none' for plain static hosting, otherwise Rayfin.
+export function createAuth(cfg = {}) {
+  return cfg.auth === 'none' ? createNoAuth() : createRayfinAuth();
 }

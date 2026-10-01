@@ -15,7 +15,7 @@ from the app's own origin.
 
 - **Hosting:** `build.mjs` copies `site/` → `dist/`, and `rayfin up` deploys `dist/` to Fabric static
   hosting. No bundler — the dashboard is a single `site/index.html` that loads ECharts, DuckDB-WASM and
-  MSAL from a CDN.
+  the Rayfin client from a CDN.
 - **Data:** the dashboard reads one `data.duckdb` (~440 MB) from `<oneLakeBase>/data/data.duckdb` over HTTPS,
   downloads it whole into OPFS, and ATTACHes it. OneLake serves it with permissive **CORS** and honors
   **ETag / conditional GETs**, so an unchanged file is a `304` (reuse the OPFS copy). Because the file is
@@ -23,21 +23,24 @@ from the app's own origin.
   ~440 MB** — an accepted trade-off for keeping everything in a single file. The dashboard also has no
   pre-aggregated daily tables in the file, so it **materializes small daily rollups once at load** to keep
   wide-range (daily-grain) charts fast over the 45 M-row 5-min fact.
-- **Auth:** OneLake needs an Entra token. The browser gets one via **MSAL.js as a public SPA client
-  (PKCE, no secret)** — `acquireTokenSilent` → `ssoSilent` → popup. The token is sent as
+- **Auth:** OneLake needs a `storage.azure.com` token. The browser signs in with **Rayfin's Fabric SSO**
+  (no extra login; inside the Fabric portal iframe the session is handed over by `postMessage`) and calls
+  one Rayfin Function, `getStorageToken` (`rayfin/functions/src/function_app.ts`), which returns a OneLake
+  token issued to the **app identity** (the owner of the Fabric app item). The token is sent as
   `Authorization: Bearer …` on each `fetch`. No `azure` DuckDB extension required — plain `httpfs`.
 
 ```
 browser (DuckDB-WASM)  ──fetch + Bearer──►  OneLake (data.duckdb)
         ▲
-        └── MSAL.js (Entra SPA, PKCE) → storage.azure.com token
+        └── Rayfin Fabric SSO → getStorageToken function → storage.azure.com token (app identity)
 ```
 
 ## Setup
 
-You need a Fabric workspace with a lakehouse and an Entra **SPA app registration** (public client, with
-the delegated **Azure Storage `user_impersonation`** permission). Put its client ID + tenant ID, and your
-OneLake base URL, into `site/config.js` (`cp site/config.example.js site/config.js`).
+You need a Fabric workspace with a lakehouse. Put your OneLake base URL into `site/config.js`
+(`cp site/config.example.js site/config.js`; `auth: "rayfin"` needs no ids — they come from the
+`rayfin.config.json` that `rayfin up` writes). The owner of the Fabric app item must be able to read the
+lakehouse (and write `query_logs/`), since the function's token carries that identity.
 
 Everything else is Rayfin — see the [Rayfin documentation](https://learn.microsoft.com/fabric/embedded/rayfin/overview) for full details:
 
@@ -46,21 +49,19 @@ rayfin login      # sign in to Fabric
 rayfin up         # build (build.mjs) + deploy dist/ to Fabric static hosting; prints the hosting URL
 ```
 
-`rayfin.yml` is already wired (`data.enabled: false`, `staticHosting.buildCommand: npm run build:fabric`),
-so it's just `rayfin up`. Upload your `data.duckdb` to `<oneLakeBase>/data/data.duckdb` in the lakehouse
-(the dashboard fetches it from exactly that path — adjust the path in `site/index.html` if you place it
-elsewhere), add the hosting URL that `rayfin up` prints to your Entra app's SPA redirect URIs, and open it
-in its own tab.
+`rayfin.yml` is already wired (`data.enabled: false`, `functions.enabled: true`,
+`staticHosting.buildCommand: npm run build:fabric`), so it's just `rayfin up`. Upload your `data.duckdb`
+to `<oneLakeBase>/data/data.duckdb` in the lakehouse (the dashboard fetches it from exactly that path).
+Open it inside the Fabric portal or in its own tab (one Fabric sign-in click there).
 
 ## limitations
 
-- **Open it standalone, not inside the Fabric portal iframe.** Acquiring an Entra token in the embedded
-  iframe is blocked by the browser (sandbox + storage partitioning), so the app shows an "open in new
-  tab" prompt there. OneLake-direct works from a top-level tab.
-- **Single-threaded** DuckDB-WASM. Multi-threading needs cross-origin isolation (COOP/COEP), which
-  severs the MSAL popup — don't know how to make it work.
-- No data is committed here; it lives in your OneLake. No secrets are committed — the client ID/tenant
-  live only in the gitignored `site/config.js` (and are public-by-design in any deployed SPA anyway).
+- **Everyone reads OneLake as the app owner.** The function's token is the app identity's, and it is
+  handed to the browser, so any user who can open the app gets (for the token's ~1 h lifetime) whatever
+  OneLake access the app item's owner has. Per-user OneLake permissions don't apply.
+- **Single-threaded** DuckDB-WASM in `rayfin` mode. Multi-threading needs cross-origin isolation
+  (COOP/COEP): the Fabric portal iframe can never be isolated, and COOP severs the Fabric sign-in popup.
+- No data is committed here; it lives in your OneLake. No secrets are committed.
 - **File format:** we use DuckDB's native `.duckdb` format for performance. Parquet files over HTTPS are also supported by DuckDB-WASM, and Iceberg is supported too — but the `azure` extension's `abfss://` scheme does not work in WASM, so OneLake access goes through plain HTTPS fetch with a Bearer token (as done here) rather than native Azure filesystem URIs.
 - Want it without a sign-in? Set `oneLakeBase: ""` in `config.js` and put `data.duckdb` at `site/data/data.duckdb`
   so it's served same-origin (no token needed). Handy for a quick local check of query changes — but don't

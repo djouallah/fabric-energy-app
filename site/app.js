@@ -1292,7 +1292,7 @@
 
     // --- Init ---
     async function startDashboard() {
-      if (!window.crossOriginIsolated) {
+      if (!window.crossOriginIsolated && window.coi?.shouldRegister?.() !== false) {
         // coi-serviceworker.js will reload the page once COI headers are active.
         // Don't start a download that would be interrupted by that reload.
         setStatus("Activating multi-threading...", "loading");
@@ -1307,51 +1307,34 @@
       await renderAll();
     }
 
-    // Inside the Fabric portal iframe the browser blocks the OneLake sign-in, so we ask
-    // the user to open the app in its own tab (a normal link can break out of the frame).
-    function showOpenInTab() {
-      const gate = document.getElementById('authGate');
-      gate.style.display = 'flex';
-      gate.innerHTML = `
-        <div style="max-width:540px;line-height:1.55">
-          <h2 style="margin-bottom:0.6rem;font-size:1.3rem">Please open this dashboard in a separate window</h2>
-          <p style="color:#9da5b4">It reads your data live from OneLake, which needs a Microsoft sign-in that the Fabric portal's embedded frame blocks. Open it in its own browser tab to continue.</p>
-        </div>
-        <a href="${window.location.href}" target="_blank" rel="noopener"
-           style="padding:0.8rem 1.6rem;font-size:1rem;border-radius:8px;background:#2563eb;color:#fff;text-decoration:none;font-weight:600">Open dashboard in new tab ↗</a>`;
-    }
-
     // --- Providers: auth + data implementations are selected by config.js (see auth.js / data.js). ---
     const cfg = window.RAYFIN_WASM_CONFIG || {};
-    const auth = createAuth(cfg, { onStatus: setStatus });
+    const auth = createAuth(cfg);
     const data = createDataSource(cfg, auth, { onStatus: setStatus });
 
-    // Render the sign-in button into the auth gate — the redirect needs a user gesture.
+    // Render the sign-in button into the auth gate — the Fabric sign-in popup needs a user gesture.
     function showSignIn(onDone) {
       const gate = document.getElementById('authGate');
       gate.style.display = 'flex';
-      gate.innerHTML = '<button id="signinBtn" style="padding:0.8rem 1.6rem;font-size:1rem;border:0;border-radius:8px;background:#2563eb;color:#fff;cursor:pointer">Sign in to load data</button>';
+      gate.innerHTML = '<button id="signinBtn" style="padding:0.8rem 1.6rem;font-size:1rem;border:0;border-radius:8px;background:#2563eb;color:#fff;cursor:pointer">Sign in with Fabric</button>';
       document.getElementById('signinBtn').onclick = async () => {
         try {
           document.getElementById('signinBtn').textContent = 'Signing in…';
           if (await auth.ensureSession(true)) { gate.style.display = 'none'; await onDone(); }
-          else document.getElementById('signinBtn').textContent = 'Sign in to load data';
+          else document.getElementById('signinBtn').textContent = 'Sign in with Fabric';
         } catch (e) { setStatus('Sign-in failed: ' + e.message, 'error'); console.error(e); }
       };
     }
 
-    // Gate. No-auth mode: ensureSession() is always true -> straight in. MSAL: a silent check
-    // (token may already be captured on redirect return); if it fails, show sign-in — or, inside
-    // the Fabric iframe where sign-in is blocked, ask to open the app standalone.
-    const EMBEDDED = window.self !== window.top;   // running inside the Fabric portal iframe
+    // Gate. No-auth mode: ensureSession() is always true -> straight in. Rayfin: the silent check
+    // covers a stored session and the Fabric iframe handoff; a standalone tab with no session gets
+    // the sign-in button.
     try {
-      if (await auth.ensureSession(false)) {   // silent / token captured from redirect return
+      if (await auth.ensureSession(false)) {
         document.getElementById('authGate').style.display = 'none';
         await startDashboard();
-      } else if (auth.mode === 'msal' && EMBEDDED) {
-        showOpenInTab();                         // iframe blocks sign-in -> open standalone
       } else {
-        showSignIn(startDashboard);              // top-level tab -> redirect sign-in
+        showSignIn(startDashboard);
       }
     } catch (e) {
       document.getElementById('authGateMsg').textContent = 'Error: ' + e.message;
