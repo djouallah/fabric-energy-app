@@ -1,12 +1,9 @@
 <!DOCTYPE html>
-<!-- Vendored from github.com/djouallah/analytics-as-code, dashboard/index.html @ a3b1429.
+<!-- Vendored from github.com/djouallah/analytics-as-code, dashboard/index.html @ b7e6051.
      Same dashboard; only hosting and data loading differ, and every local change is marked FABRIC.
      To pick up upstream changes (run in this repo):
-       git -C <analytics-as-code> diff a3b1429..HEAD -- dashboard/index.html | git apply -p2 --directory=site
-     then update the sha above.
-     Ahead of upstream until ported there: generators on the Flows map, KPI sparklines and
-     deltas, the History tab, the Batteries and ownership charts, date presets. None of it is
-     FABRIC-specific; the command above may need a manual merge until then. -->
+       git -C <analytics-as-code> diff b7e6051..HEAD -- dashboard/index.html | git apply -p2 --directory=site
+     then update the sha above. -->
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -1394,10 +1391,10 @@
       const last = to >= maxDate ? shiftDate(maxDate, -1) : to;
       const days = Math.round((new Date(last) - new Date(from)) / 86400000) + 1;
       const prevFrom = shiftDate(from, -days);
-      if (!(days >= 1) || prevFrom < minDate || (!aggLoaded && prevFrom < _recentFrom)) return ids.forEach(id => show(id));
+      if (!(days >= 1) || prevFrom < minDate) return ids.forEach(id => show(id));
 
       const dates = a => `${a}.date >= DATE ${sqlStr(prevFrom)} AND ${a}.date <= DATE ${sqlStr(last)}`;
-      const cur = a => `CAST(${a}.date >= DATE ${sqlStr(from)} AS INTEGER) AS cur`;
+      const cur = a => `CAST(${a}.date >= DATE ${sqlStr(from)} AS INTEGER) AS cur, CAST(COUNT(DISTINCT ${a}.date) AS INTEGER) AS n`;
       const out = 'GREATEST(sc.mwh, 0)';
       const DIM = 'LEFT JOIN dim.dim_duid d ON sc.DUID = d.DUID';
       const [gen, price, re] = await Promise.all([
@@ -1414,7 +1411,9 @@
       ]);
       if (seq !== _renderSeq) return;
       const vs = days === 1 ? 'vs the day before' : `vs previous ${days} days`;
-      const pair = rows => [rows.find(r => r.cur === 1)?.v, rows.find(r => r.cur === 0)?.v];
+      // A side that doesn't hold every day of its period (the daily history not attached yet,
+      // a gap in the data) gives no comparison.
+      const pair = rows => [1, 0].map(c => rows.find(r => r.cur === c && r.n === days)?.v);
       // A change that rounds to zero reads "unchanged", not as an arrow on 0.0.
       const delta = (id, d, fmt, cls = '') => {
         const size = Math.abs(d).toFixed(1);
@@ -2141,7 +2140,7 @@
       wind:   { title: 'wind output', fmt: fmtGwh, ramp: () => RAMPS.blue[isLight() ? 'light' : 'dark'] },
     };
 
-    // Opens one day on the Dashboard (a day older than the 14-day file attaches the history).
+    // Opens one day on the Dashboard (an older day loads its 5-minute history on the way).
     function openDay(date) {
       document.getElementById('dateFrom').value = date;
       document.getElementById('dateTo').value = date;
@@ -2183,6 +2182,7 @@
       };
 
       // --- records: the best day of each measure; "new" when it fell in the last 14 days ---
+      const newSince = shiftDate(document.getElementById('dateTo').max, -14);
       const best = (list, sign = 1) => list.reduce((b, d) => !b || sign * d[1] > sign * b[1] ? d : b, null);
       const records = [
         ['Highest renewable share', 're', best(days.re)],
@@ -2195,7 +2195,7 @@
       recordsEl.innerHTML = records.map(([label, metric, [date, v]]) => `
         <button type="button" class="kpi-card record-card" data-date="${date}" title="Open ${formatDate(date)} on the Dashboard">
           <div class="kpi-label">${label}</div><div class="kpi-value">${CAL_METRICS[metric].fmt(v)}</div>
-          <div class="kpi-sub">${formatDate(date)}${date >= _recentFrom ? '<span class="record-new">new</span>' : ''}</div>
+          <div class="kpi-sub">${formatDate(date)}${date >= newSince ? '<span class="record-new">new</span>' : ''}</div>
         </button>`).join('');
       for (const card of recordsEl.querySelectorAll('.record-card')) card.addEventListener('click', () => openDay(card.dataset.date));
 
