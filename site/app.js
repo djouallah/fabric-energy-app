@@ -254,12 +254,19 @@
     // 5. SQL QUERY BUILDERS
     // =========================================================================
 
-    // fct_summary joined to its dimension, inlined (replaces the old v_model VIEW). Use this only
+    // 5-min rows: `db.fct_recent` (local hot file, last ~7 days) when the range starts inside it,
+    // else `full.fct_summary` (remote, Range reads — attach it first with data.attachFull()).
+    let _recentFrom = null;   // first date in db.fct_recent, set by populateFilters
+    const RECENT = 'db.fct_recent';
+    function fiveMin(from) { return _recentFrom && from >= _recentFrom ? RECENT : 'full.fct_summary'; }
+    async function ensureFiveMin(from) { if (fiveMin(from) !== RECENT) await data.attachFull(); }
+
+    // A 5-min table joined to its dimension, inlined (replaces the old v_model VIEW). Use this only
     // where a query needs dim columns (Region / FuelSourceDescriptor / latitude / longitude);
-    // fact-only queries should hit db.fct_summary directly to skip the join.
-    const VMODEL = `(SELECT f.DUID, f.date, f.time, f.mw, f.price, f.cutoff,
+    // fact-only queries should hit the table directly to skip the join.
+    const vmodel = (fct) => `(SELECT f.DUID, f.date, f.time, f.mw, f.price, f.cutoff,
                             d.Region, d.FuelSourceDescriptor, d.latitude, d.longitude
-                     FROM db.fct_summary f JOIN db.dim_duid d ON f.DUID = d.DUID)`;
+                     FROM ${fct} f JOIN db.dim_duid d ON f.DUID = d.DUID)`;
 
     const sql = {
       // --- WHERE clauses ---
@@ -388,7 +395,7 @@
       // --- Cutoff timestamp ---
       // Data-freshness ts from the fact's own `cutoff` column. Shown verbatim as stored — no
       // timezone conversion anywhere.
-      cutoff: "SELECT CAST(MAX(cutoff) AS VARCHAR) AS last_update FROM db.fct_summary",
+      cutoff: `SELECT CAST(MAX(cutoff) AS VARCHAR) AS last_update FROM ${RECENT}`,
     };
 
     // --- Storage engine: materialize the ONE shared base scan (see docs/query-engine-spec.md) ---
@@ -404,16 +411,9 @@
     // year → a month inside it keeps the scan; only widening the range pays a new scan.
     let _baseRange = null;   // { from, to, intraday } the current _base was materialized for
 
-    // Daily grain reads db.fct_daily (DUID, date, mwh, price_sum, price_cnt — written by import.py)
-    // when the file has it: a wide range is then a few MB instead of a scan of the 5-min fact over
-    // HTTP (2018→today = the whole 1.3 GB, minutes). Falls back to rolling up fct_summary otherwise.
-    let _hasDaily = false;
-    async function detectDaily() {
-      const r = await runQuery("SELECT 1 AS ok FROM duckdb_tables() WHERE database_name = 'db' AND table_name = 'fct_daily'");
-      _hasDaily = r.length > 0;
-      perf.log('info', _hasDaily ? 'daily grain: db.fct_daily' : 'daily grain: rollup of db.fct_summary (no fct_daily in file)');
-    }
-
+    // Daily grain reads db.fct_daily (DUID, date, mwh, price_sum, price_cnt — the import's rollup,
+    // local): any range is a few MB in memory. Intraday (5-min) reads fct_recent locally, or the
+    // remote full file when the day is older than the hot window.
     async function materializeBase() {
       const intraday = isIntradayMode();
       const { from, to } = getDateRange();
@@ -423,20 +423,18 @@
 
       const dims = 'd.Region, d.FuelSourceDescriptor AS fuel, d.latitude AS lat, d.longitude AS lon';
       let body;
-      if (!intraday && _hasDaily) {
+      if (!intraday) {
         body = `SELECT f.DUID, f.date, ${dims}, f.mwh, f.price_sum, f.price_cnt
                 FROM db.fct_daily f JOIN db.dim_duid d ON f.DUID = d.DUID
                 WHERE f.date >= '${from}' AND f.date <= '${to}'`;
       } else {
-        const time = intraday ? 'f.time,' : '';
-        const val = intraday ? 'SUM(f.mw)::DOUBLE AS mw' : 'CAST(SUM(f.mw)/12.0 AS REAL) AS mwh';
-        const grp = intraday ? 'f.DUID, f.date, f.time' : 'f.DUID, f.date';
-        body = `SELECT f.DUID, f.date, ${time} ${dims},
-                       ${val},
+        await ensureFiveMin(from);
+        body = `SELECT f.DUID, f.date, f.time, ${dims},
+                       SUM(f.mw)::DOUBLE AS mw,
                        SUM(f.price) AS price_sum, COUNT(f.price) AS price_cnt
-                FROM db.fct_summary f JOIN db.dim_duid d ON f.DUID = d.DUID
+                FROM ${fiveMin(from)} f JOIN db.dim_duid d ON f.DUID = d.DUID
                 WHERE f.date >= '${from}' AND f.date <= '${to}'
-                GROUP BY ${grp}, d.Region, d.FuelSourceDescriptor, d.latitude, d.longitude`;
+                GROUP BY f.DUID, f.date, f.time, d.Region, d.FuelSourceDescriptor, d.latitude, d.longitude`;
       }
       // noCache: a side-effecting DDL that must run when called; the containment guard above is
       // what prevents redundant rebuilds (caching its empty result would be a staleness hazard).
@@ -567,12 +565,12 @@
       if (crossFilter.duids.length) mwFilters.push(`sc.DUID IN (${crossFilter.duids.map(d => `'${d}'`).join(',')})`);
       const mwWhere = mwFilters.length ? `AND ${mwFilters.join(' AND ')}` : '';
       // Region/Fuel filters need the dim; otherwise (incl. a DUID-only filter) stay on the fact.
-      const mwSrc = (region || fuel) ? `${VMODEL} sc` : 'db.fct_summary sc';
+      const mwSrc = (region || fuel) ? `${vmodel(RECENT)} sc` : `${RECENT} sc`;
       const latestMWResult = await runQuery(`
         SELECT SUM(sc.mw)::DOUBLE AS total_mw, CAST(sc.date AS VARCHAR) AS d, sc.time
         FROM ${mwSrc}
-        WHERE sc.date = (SELECT MAX(date) FROM db.fct_summary)
-          AND sc.time = (SELECT MAX(time) FROM db.fct_summary WHERE date = (SELECT MAX(date) FROM db.fct_summary))
+        WHERE sc.date = (SELECT MAX(date) FROM ${RECENT})
+          AND sc.time = (SELECT MAX(time) FROM ${RECENT} WHERE date = (SELECT MAX(date) FROM ${RECENT}))
           ${mwWhere}
         GROUP BY sc.date, sc.time`);
       if (latestMWResult.length) {
@@ -647,9 +645,9 @@
         SELECT AVG(p.price)::DOUBLE AS avg_price, CAST(p.date AS VARCHAR) AS d, p.time
         FROM (
           SELECT Region, date, time, AVG(price) AS price
-          FROM ${VMODEL}
-          WHERE date = (SELECT MAX(date) FROM db.fct_summary)
-            AND time = (SELECT MAX(time) FROM db.fct_summary WHERE date = (SELECT MAX(date) FROM db.fct_summary))
+          FROM ${vmodel(RECENT)}
+          WHERE date = (SELECT MAX(date) FROM ${RECENT})
+            AND time = (SELECT MAX(time) FROM ${RECENT} WHERE date = (SELECT MAX(date) FROM ${RECENT}))
           GROUP BY Region, date, time
         ) p
         WHERE TRUE ${priceWhere}
@@ -906,7 +904,8 @@
       // Daily (no time dim) over a daily base → re-aggregate the shared `_base` directly: one scan,
       // shared with the dashboard and visible to the export connection, both measures from one
       // source (no gen⋈price join). Price = SUM(price_sum)/SUM(price_cnt), the exact flat average.
-      // Raw (5-min) or intraday mode falls back to scanning the fact via VMODEL below.
+      // Raw (5-min) or intraday mode scans the 5-min rows via vmodel() below: fct_recent when the
+      // range starts inside the hot window, else the remote full.fct_summary.
       if (!raw && !isIntradayMode()) {
         const sel = [], grp = [], ord = [];
         if (dimensions.date) { sel.push('CAST(date AS VARCHAR) AS date'); grp.push('date'); ord.push('date'); }
@@ -957,13 +956,14 @@
 
       // FROM clause
       let from;
-      const scSrc = raw ? VMODEL
+      const VM = vmodel(fiveMin(getDateRange().from));
+      const scSrc = raw ? VM
         : `(SELECT DUID, date, Region, FuelSourceDescriptor, latitude, longitude,
-               CAST(SUM(mw)/12.0 AS REAL) AS mwh FROM ${VMODEL}
+               CAST(SUM(mw)/12.0 AS REAL) AS mwh FROM ${VM}
              GROUP BY DUID, date, Region, FuelSourceDescriptor, latitude, longitude)`;
       const prSrc = raw
-        ? `(SELECT Region, date, time, AVG(price) AS price FROM ${VMODEL} GROUP BY Region, date, time)`
-        : `(SELECT Region, date, AVG(price) AS price FROM ${VMODEL} GROUP BY Region, date)`;
+        ? `(SELECT Region, date, time, AVG(price) AS price FROM ${VM} GROUP BY Region, date, time)`
+        : `(SELECT Region, date, AVG(price) AS price FROM ${VM} GROUP BY Region, date)`;
       if (hasGen && hasPrice) {
         const timeJoin = raw ? 'AND sc.time = p.time' : '';
         from = `${scSrc} sc LEFT JOIN ${prSrc} p ON sc.date = p.date ${timeJoin} AND sc.Region = p.Region`;
@@ -1002,6 +1002,7 @@
     async function ensureAnalyzeData() {
       const { dimensions } = getAnalyzeOptions();
       if (!dimensions.time && !isIntradayMode()) await materializeBase();
+      if (/\bfull\./.test(getAnalyzeSql())) await data.attachFull();   // remote 5-min history
     }
 
     // --- Analyze: preview ---
@@ -1155,8 +1156,10 @@
       allDuids = await runQuery(sql.allDuids);
 
       // Set date range defaults: last 3 days up to max date in data
-      const maxDateResult = await runQuery("SELECT CAST(MAX(date) AS VARCHAR) AS d FROM db.fct_summary");
+      const maxDateResult = await runQuery(`SELECT CAST(MAX(date) AS VARCHAR) AS d FROM ${RECENT}`);
       const minDateResult = await runQuery("SELECT CAST(MIN(date) AS VARCHAR) AS d FROM db.dim_calendar");
+      _recentFrom = (await runQuery(`SELECT CAST(MIN(date) AS VARCHAR) AS d FROM ${RECENT}`))[0].d;
+      perf.log('info', `5-min rows local from ${_recentFrom} (fct_recent); older days read the remote full file`);
       const maxDate = maxDateResult[0].d;
       const minDate = minDateResult[0].d;
       const fromDate = new Date(maxDate);
@@ -1244,7 +1247,6 @@
       const { db, conn: c } = await data.init();
       _db = db;
       conn = c;
-      await detectDaily();
       await populateFilters();
       await renderAll();
     }
