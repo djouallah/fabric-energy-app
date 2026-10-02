@@ -10,6 +10,8 @@ It is the same dashboard as [NemTracker](https://nemtracker.github.io/), hosted 
 
 ## How it works
 
+![Architecture](architecture.svg)
+
 - **Hosting:** `rayfin up` deploys the `site/` folder to Fabric static hosting.
 - **Sign-in:** Fabric single sign-on. Inside the Fabric portal there is no extra login; in its own
   tab it is one click.

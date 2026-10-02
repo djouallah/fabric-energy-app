@@ -9,7 +9,7 @@ turns Apache Iceberg tables into a few DuckDB files in a OneLake lakehouse, and 
 those files itself with DuckDB-WASM. Fabric supplies hosting, sign-in and a short-lived read-only
 SAS for the data folder.
 
-Diagram: `architecture.excalidraw` (open at excalidraw.com or with the VS Code Excalidraw extension).
+Diagram: `architecture.svg` (shown in the README); `architecture.excalidraw` is the editable copy.
 
 ```
 Iceberg catalog (OneLake, source tenant)
