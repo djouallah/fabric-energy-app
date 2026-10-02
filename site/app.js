@@ -1,4 +1,5 @@
     import { createAuth } from './auth.js';
+    import { perf } from './perflog.js';
     import { createDataSource } from './data.js';
 
     // =========================================================================
@@ -116,8 +117,10 @@
         const cached = _queryCache.get(sqlStr);
         if (cached) return cached;
       }
+      const t0 = performance.now();
       const result = await queryDb(conn, sqlStr);
       const numRows = Number(result.numRows);
+      perf.log('query', sqlStr.replace(/\s+/g, ' ').trim(), { ms: performance.now() - t0, status: `${numRows} rows` });
       const fields = result.schema.fields;
       const columns = fields.map(f => {
         const col = result.getChild(f.name);
@@ -763,6 +766,33 @@
     document.addEventListener('click', () => { document.getElementById('duidPanel').classList.remove('open'); document.querySelectorAll('.dd-panel.open').forEach(p => p.classList.remove('open')); });
     document.getElementById('duidSearch').addEventListener('input', e => renderDuidList(e.target.value));
 
+    // --- Logs tab: in-memory timings (perflog.js), newest first. Re-rendered on new events while
+    // visible (throttled to one render per animation frame).
+    const _pageStart = performance.timeOrigin;
+    let _logsFrame = 0;
+    function renderLogs() {
+      _logsFrame = 0;
+      if (document.getElementById('view-logs').style.display === 'none') return;
+      const ev = perf.events;
+      const sum = (k) => ev.filter(e => e.kind === k);
+      const http = sum('http'), reads = http.filter(e => e.range);
+      const ms = (a) => a.reduce((s, e) => s + (e.ms || 0), 0);
+      const kb = (a) => a.reduce((s, e) => s + (e.bytes || 0), 0) / 1024;
+      const pct = (a, p) => { const v = a.map(e => e.ms).sort((x, y) => x - y); return v.length ? v[Math.min(v.length - 1, Math.floor(p * v.length))] : 0; };
+      document.getElementById('logsSummary').textContent = [
+        `HTTP requests : ${http.length}  (Range reads/seeks: ${reads.length})   ${(kb(http) / 1024).toFixed(1)} MB`,
+        `seek latency  : avg ${(ms(reads) / (reads.length || 1)).toFixed(0)} ms   p50 ${pct(reads, 0.5).toFixed(0)} ms   p95 ${pct(reads, 0.95).toFixed(0)} ms   max ${pct(reads, 1).toFixed(0)} ms   sum ${(ms(reads) / 1000).toFixed(1)} s`,
+        `SAS calls     : ${sum('sas').length}  (${ms(sum('sas')).toFixed(0)} ms)    ATTACH: ${ms(sum('attach')).toFixed(0)} ms    queries: ${sum('query').length}  (${(ms(sum('query')) / 1000).toFixed(1)} s)`,
+      ].join('\n');
+      const esc = (t) => String(t).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
+      document.querySelector('#logsTable tbody').innerHTML = ev.slice().reverse().map(e =>
+        `<tr><td>${((e.at - _pageStart) / 1000).toFixed(2)}</td><td>${e.kind}</td><td>${esc(e.what)}</td>` +
+        `<td>${esc(e.range || '')}</td><td>${esc(e.status ?? '')}</td>` +
+        `<td>${e.bytes == null ? '' : (e.bytes / 1024).toFixed(0)}</td><td>${e.ms == null ? '' : e.ms.toFixed(0)}</td></tr>`).join('');
+    }
+    perf.onChange(() => { _logsFrame ||= requestAnimationFrame(renderLogs); });
+    document.getElementById('logsClear').onclick = () => perf.clear();
+
     // --- Tab switching ---
     for (const btn of document.querySelectorAll('.tab-btn')) {
       btn.addEventListener('click', () => {
@@ -771,6 +801,8 @@
         const tab = btn.dataset.tab;
         document.getElementById('view-dashboard').style.display = tab === 'dashboard' ? '' : 'none';
         document.getElementById('view-analyze').style.display = tab === 'analyze' ? '' : 'none';
+        document.getElementById('view-logs').style.display = tab === 'logs' ? '' : 'none';
+        if (tab === 'logs') renderLogs();
         // Populate the SQL box the first time Analyze is opened; don't clobber manual edits after.
         if (tab === 'analyze' && !document.getElementById('analyzeSql').value.trim()) syncAnalyzeSql();
       });
@@ -1169,12 +1201,6 @@
 
     // --- Init ---
     async function startDashboard() {
-      if (!window.crossOriginIsolated && window.coi?.shouldRegister?.() !== false) {
-        // coi-serviceworker.js will reload the page once COI headers are active.
-        // Don't start a download that would be interrupted by that reload.
-        setStatus("Activating multi-threading...", "loading");
-        return;
-      }
       const { db, conn: c } = await data.init();
       _db = db;
       conn = c;

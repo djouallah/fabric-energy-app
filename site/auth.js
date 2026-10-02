@@ -14,6 +14,8 @@
 
 // Keep these on the same version: jsDelivr resolves their shared deps (rayfin-auth, rayfin-lib)
 // to the same module URLs, so the provider operates on the client's own Auth instance.
+import { perf } from './perflog.js';
+
 const RAYFIN_CLIENT_ESM = "https://cdn.jsdelivr.net/npm/@microsoft/rayfin-client@1.36.1/+esm";
 const RAYFIN_FABRIC_ESM = "https://cdn.jsdelivr.net/npm/@microsoft/rayfin-auth-provider-fabric@1.36.1/+esm";
 
@@ -65,7 +67,7 @@ function createRayfinAuth() {
   async function dataAccess() {
     if (fresh(_data)) return _data;
     await init();
-    _data = await _client.functions.getDataSas.invoke();
+    _data = await perf.time('sas', 'getDataSas (function call)', () => _client.functions.getDataSas.invoke());
     save(_data);
     return _data;
   }

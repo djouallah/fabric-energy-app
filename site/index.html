@@ -6,14 +6,10 @@
   <title>Australian Energy Dashboard</title>
   <script src="config.js"></script>
   <script>
-    // Rayfin auth runs inside the Fabric portal iframe (which can never be cross-origin isolated)
-    // and signs standalone tabs in through a Fabric popup (which COOP: same-origin severs), so only
-    // the no-auth static build uses the COOP/COEP service worker for multi-threaded DuckDB.
-    if ((window.RAYFIN_WASM_CONFIG || {}).auth !== 'none') {
-      window.coi = { shouldRegister: () => false, shouldDeregister: () => true };
-    }
+    // DuckDB runs single-threaded; there is no service worker. Unregister the COOP/COEP one that
+    // earlier versions installed, so it stops rewriting response headers for returning visitors.
+    navigator.serviceWorker?.getRegistrations().then(rs => rs.forEach(r => r.unregister())).catch(() => {});
   </script>
-  <script src="coi-serviceworker.js"></script>
   <link rel="preconnect" href="https://cdn.jsdelivr.net">
   <link rel="preconnect" href="https://onelake.dfs.fabric.microsoft.com" crossorigin>
   <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
@@ -142,6 +138,7 @@
   <div class="tab-bar">
     <button class="tab-btn active" data-tab="dashboard">Dashboard</button>
     <button class="tab-btn" data-tab="analyze">Analyze</button>
+    <button class="tab-btn" data-tab="logs">Logs</button>
   </div>
 
   <div id="view-dashboard">
@@ -204,6 +201,20 @@
     <div class="analyze-info" id="analyzeInfo"></div>
     <div class="analyze-table-wrap">
       <table class="analyze-table" id="analyzeTable"></table>
+    </div>
+  </div>
+
+  <div id="view-logs" style="display:none">
+    <div class="analyze-controls">
+      <button class="btn-analyze" id="logsClear" type="button">Clear</button>
+      <span class="analyze-info" style="padding:0">Timings for this page only — kept in memory, nothing is stored. "http" rows are DuckDB's reads of the OneLake file (Range = seek).</span>
+    </div>
+    <div class="analyze-info" id="logsSummary" style="white-space:pre;font-family:ui-monospace,Consolas,monospace"></div>
+    <div class="analyze-table-wrap">
+      <table class="analyze-table" id="logsTable">
+        <thead><tr><th>t (s)</th><th>Type</th><th>What</th><th>Range</th><th>Status</th><th>KB</th><th>ms</th></tr></thead>
+        <tbody></tbody>
+      </table>
     </div>
   </div>
 

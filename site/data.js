@@ -22,6 +22,7 @@
 // =============================================================================
 
 import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.32.0/+esm";
+import { perf, HTTP_TRACE_SHIM } from "./perflog.js";
 
 export function createDataSource(cfg = {}, auth, { onStatus = () => {} } = {}) {
   const baseUrl = cfg.dataBaseUrl ?? cfg.oneLakeBase ?? '';
@@ -102,7 +103,13 @@ export function createDataSource(cfg = {}, auth, { onStatus = () => {} } = {}) {
     try {
       // no-store: latest.txt is a moving pointer; a cached copy would resolve to a stale db
       // filename and the dashboard would never pick up a fresh import.
-      const fetchLatest = async () => fetch(await dataUrl('latest.txt'), { headers: auth.getHeaders(), cache: 'no-store' });
+      const fetchLatest = async () => {
+        const url = await dataUrl('latest.txt');
+        const t = performance.now();
+        const r = await fetch(url, { headers: auth.getHeaders(), cache: 'no-store' });
+        perf.log('fetch', 'GET latest.txt', { ms: performance.now() - t, status: r.status });
+        return r;
+      };
       let resp = await fetchLatest();
       if (authFailed(resp)) { await auth.refresh(); resp = await fetchLatest(); }
       if (!resp.ok) return 'data.duckdb';
@@ -133,7 +140,7 @@ export function createDataSource(cfg = {}, auth, { onStatus = () => {} } = {}) {
     const { baseUrl: dir, sas, expiresOn } = await auth.dataAccess();
     const name = `r${n}_${file}`;
     await db.registerFileURL(name, `${dir}/${file}?${sas}`, duckdb.DuckDBDataProtocol.HTTP, false);
-    await conn.query(`ATTACH '${name}' AS db (READ_ONLY);`);
+    await perf.time('attach', `ATTACH ${file}`, () => conn.query(`ATTACH '${name}' AS db (READ_ONLY);`));
     const old = _remote?.name;
     _remote = { db, conn, file, name, n, expiresAt: Date.parse(expiresOn) };
     if (old) await db.dropFile(old).catch(() => {});
@@ -146,7 +153,7 @@ export function createDataSource(cfg = {}, auth, { onStatus = () => {} } = {}) {
     _reattaching ??= (async () => {
       const { db, conn, file, n } = _remote;
       if (force) await auth.refresh();
-      await conn.query('DETACH db;');
+      await perf.time('attach', 'DETACH (re-attach with fresh SAS)', () => conn.query('DETACH db;'));
       await attachRemote(db, conn, file, n + 1);
     })().finally(() => { _reattaching = null; });
     return _reattaching;
@@ -157,7 +164,8 @@ export function createDataSource(cfg = {}, auth, { onStatus = () => {} } = {}) {
     const JSDELIVR_BUNDLES = duckdb.getJsDelivrBundles();
     const bundle = await duckdb.selectBundle(JSDELIVR_BUNDLES);
     const workerUrl = URL.createObjectURL(
-      new Blob([`importScripts("${bundle.mainWorker}");`], { type: "text/javascript" })
+      // HTTP_TRACE_SHIM: times every HTTP request DuckDB makes (seeks) for the Logs tab.
+      new Blob([HTTP_TRACE_SHIM, `\nimportScripts("${bundle.mainWorker}");`], { type: "text/javascript" })
     );
     const worker = new Worker(workerUrl);
     const logger = new duckdb.ConsoleLogger();
@@ -184,7 +192,6 @@ export function createDataSource(cfg = {}, auth, { onStatus = () => {} } = {}) {
       console.log(`[OPFS] ${dbFile}: ${sourceLabel[dbResult.source]}`);
     }
     await conn.query("SET preserve_insertion_order = false;");
-    console.log(`[DuckDB] crossOriginIsolated: ${window.crossOriginIsolated} (${window.crossOriginIsolated ? 'multi-threaded' : 'single-threaded'})`);
 
     return { db, conn };
   }
