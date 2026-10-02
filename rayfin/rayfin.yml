@@ -8,7 +8,8 @@ services:
       enabled: true
     allowedRedirectUris:
       - http://localhost:5173
-      - https://witty-tulip-42d15256d2-westeurope.webapp.fabricapps.net
+      - http://127.0.0.1:5173
+      - https://savvy-jade-69ff04fc1f-westeurope.webapp.fabricapps.net
   data:
     enabled: false
   staticHosting:
