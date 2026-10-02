@@ -1,10 +1,10 @@
-# Run first, in a cell of its own (the catalog needs the pre-release duckdb):
-#   !pip install -q duckdb --pre --upgrade
-#   notebookutils.session.restartPython()
-import duckdb, datetime, glob, os, shutil
-from azure.identity import DeviceCodeCredential
+import duckdb, datetime, json, os, shutil, urllib.request
+from azure.core.exceptions import ResourceNotFoundError
+from azure.identity import ClientAssertionCredential
+from azure.storage.filedatalake import DataLakeServiceClient
 
-# Builds the dashboard's files in Files/data from the analytics-as-code OneLake Iceberg catalog.
+# Builds the dashboard's files from the analytics-as-code OneLake Iceberg catalog and uploads
+# them to the dashboard's lakehouse. Runs on a GitHub runner (.github/workflows/import_data.yml).
 # The tables are the ones analytics-as-code's scripts/cache_catalog.py builds, so the same
 # dashboard SQL reads them. There is no file-size limit here, so the 5-minute history is one
 # file instead of half-year files:
@@ -15,39 +15,58 @@ from azure.identity import DeviceCodeCredential
 #   latest.txt         the current data_<ts>.duckdb; the other names follow from its <ts>
 ENDPOINT = 'https://onelake.table.fabric.microsoft.com/iceberg'
 WAREHOUSE = '6f966b71-c396-462d-8783-e95224906cef/34a7601b-e1bb-423b-b60e-1c5c69c219a8'  # power / nem
-DATA = '/lakehouse/default/Files/data'
-TMP = '/tmp/import_iceberg'
+# Where the dashboard reads: workspace `app`, lakehouse `data` (another tenant than the catalog's).
+LAKE = 'https://onelake.dfs.fabric.microsoft.com'
+WORKSPACE, FOLDER = 'app', 'data.Lakehouse/Files/data'
+OUT = 'out'      # the .duckdb files, built on the runner's disk and then uploaded
+TMP = 'export'   # the catalog's rows as parquet
 SOURCES = ('mart.dim_calendar', 'mart.dim_duid', 'landing.fct_scada', 'landing.fct_price',
            'landing.fct_scada_today', 'landing.fct_price_today', 'landing.fct_regionsum_today',
            'landing.fct_interconnector_today')
+FILES = ('dim', 'today', 'agg', 'data')
 FIRST_YEAR = 2018
 RECENT_DAYS = 14
 LAYOUT = 2  # bump when the files or their tables change: forces a rebuild on an unchanged source
-
-# The catalog lives in another tenant than this notebook, so the notebook's own token is refused
-# there (the catalog answers 404). Sign in once with an account of that tenant: the device-code
-# link and code are printed under the cell on the first catalog call. The credential is kept
-# across re-runs of the cell and renews its token by itself.
-TENANT = 'organizations'  # the account's home tenant; put the catalog's tenant id here for a guest account
-if '_credential' not in globals():
-    _credential = DeviceCodeCredential(tenant_id=TENANT)
 
 # The .duckdb files are read by the dashboard's DuckDB-WASM (the 1.5 line), so they are written
 # in a storage version it opens, whatever duckdb is installed here.
 STORAGE = "STORAGE_VERSION 'v1.4.0'"
 
 
+# No secret anywhere. The job's GitHub identity token (OIDC) is exchanged for a OneLake token in
+# each tenant: CATALOG_* is the app registration that reads the catalog, LAKE_* the one that
+# writes the dashboard's lakehouse; both trust this repo's main branch (a federated credential).
+# azure-identity asks for a new GitHub token whenever it needs a new Azure one.
+def github_token():
+    request = urllib.request.Request(
+        os.environ['ACTIONS_ID_TOKEN_REQUEST_URL'] + '&audience=api://AzureADTokenExchange',
+        headers={'Authorization': 'bearer ' + os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']})
+    with urllib.request.urlopen(request) as r:
+        return json.load(r)['value']
+
+
+def credential(name):
+    return ClientAssertionCredential(os.environ[f'{name}_TENANT_ID'], os.environ[f'{name}_CLIENT_ID'],
+                                     github_token)
+
+
+catalog_login = credential('CATALOG')
+lake = DataLakeServiceClient(LAKE, credential=credential('LAKE')).get_file_system_client(WORKSPACE)
+
+
 # Runs the statements against the attached catalog and returns the last one's rows. The catalog
 # vends no storage credentials (access_delegation_mode 'none'), so the azure secret is what
 # authorises the data-file reads. TimeZone must be UTC: SETTLEMENTDATE is AEMO's wall clock
-# stored as TIMESTAMPTZ labelled UTC. A connection per call, with the signed-in user's token:
-# it lasts about an hour and a duckdb secret doesn't refresh, which is also why the facts are
-# exported a year at a time.
+# stored as TIMESTAMPTZ labelled UTC. A connection per call, with a token taken per call: it
+# lasts about an hour and a duckdb secret doesn't refresh, which is also why the facts are
+# exported a year at a time. The azure extension's default transport fails the OneLake TLS
+# handshake on GitHub runners; the workflow sets it to curl.
 def catalog(*sql):
-    token = _credential.get_token('https://storage.azure.com/.default').token
+    token = catalog_login.get_token('https://storage.azure.com/.default').token
     con = duckdb.connect()
     con.install_extension('iceberg')
     con.load_extension('iceberg')
+    con.execute(f"SET GLOBAL azure_transport_option_type = '{os.environ.get('AZURE_TRANSPORT_OPTION_TYPE', 'default')}'")
     con.execute(f"CREATE SECRET onelake_storage (TYPE azure, PROVIDER access_token, ACCESS_TOKEN '{token}')")
     con.execute(f"ATTACH '{WAREHOUSE}' AS catalog "
                 f"(TYPE ICEBERG, ENDPOINT '{ENDPOINT}', TOKEN '{token}', ACCESS_DELEGATION_MODE 'none')")
@@ -60,7 +79,7 @@ def catalog(*sql):
 
 
 # Rebuild only when the source changed: the current snapshot id of every source table, kept in
-# source_version.txt next to the files.
+# source_version.txt next to the uploaded files.
 def source_version():
     rows = catalog(' UNION ALL '.join(
         f"SELECT '{t}', arg_max(snapshot_id, timestamp_ms) FROM iceberg_snapshots(catalog.{t})"
@@ -134,12 +153,12 @@ def export():
     for year in range(FIRST_YEAR, datetime.date.today().year + 1):
         catalog(copy_scada('fct_scada', f'INTERVENTION = 0 AND YEAR = {year}', f'scada_{year}'),
                 copy_price(f'YEAR = {year}', f'price_{year}'))
-        print(f'exported {year}')
+        print(f'exported {year}', flush=True)
     # fct_scada_today has no INTERVENTION column
     catalog(copy_scada('fct_scada_today', after_history('scada'), 'scada_today'),
             copy_price_today(after_history('price'), 'price_today'),
             copy_interconnector('interconnector_today'))
-    print('exported today')
+    print('exported today', flush=True)
 
 
 # AEMO's interval as the dashboard's columns: the date and the time of day as HHMM.
@@ -147,10 +166,11 @@ DATE_TIME = "CAST(ts AS DATE) AS date, CAST(strftime(ts, '%H%M') AS SMALLINT) AS
 
 
 def build(ts):
-    fname = f'data_{ts}.duckdb'
+    shutil.rmtree(OUT, ignore_errors=True)
+    os.makedirs(OUT)
     con = duckdb.connect()
-    for name in ('data', 'dim', 'today', 'agg'):
-        con.execute(f"ATTACH '{DATA}/{name}_{ts}.duckdb' AS {name} ({STORAGE})")
+    for name in FILES:
+        con.execute(f"ATTACH '{OUT}/{name}_{ts}.duckdb' AS {name} ({STORAGE})")
     con.execute('USE data')
 
     # The 5-minute history, one file. Sorted by date, so a date range is a few blocks over HTTP.
@@ -212,35 +232,51 @@ def build(ts):
     for t in ('dim.dim_calendar', 'dim.dim_duid', 'agg.scada_hourly', 'agg.price_hourly',
               'agg.month_days'):
         print(t, con.execute(f'SELECT count(*) FROM {t}').fetchone()[0])
-
     con.close()
 
-    # Last, once every file it leads to is complete.
-    with open(f'{DATA}/latest.txt', 'w') as f:
-        f.write(fname)
+
+def lake_file(name):
+    return lake.get_file_client(f'{FOLDER}/{name}')
+
+
+def read_text(name):
+    try:
+        return lake_file(name).download_file().readall().decode().strip()
+    except ResourceNotFoundError:
+        return None
+
+
+def publish(ts, version):
+    for name in (f'{f}_{ts}.duckdb' for f in FILES):
+        with open(f'{OUT}/{name}', 'rb') as f:
+            lake_file(name).upload_data(f, overwrite=True, max_concurrency=8)
+        print(f'uploaded {name} ({os.path.getsize(f"{OUT}/{name}") / 1e6:.0f} MB)', flush=True)
+
+    # Last, once every file it leads to is there.
+    lake_file('latest.txt').upload_data(f'data_{ts}.duckdb'.encode(), overwrite=True)
+    lake_file('source_version.txt').upload_data(version.encode(), overwrite=True)
 
     # Keep the new files + 1 previous version (dashboards opened before this import still read
     # the previous one); delete older ones. Names carry the timestamp, so sorted order is
     # chronological. hot_* is the previous layout's file: nothing reads it any more.
-    for prefix in ('data', 'dim', 'today', 'agg'):
-        for p in sorted(glob.glob(f'{DATA}/{prefix}_*.duckdb'))[:-2]:
-            os.remove(p)
-            print(f'removed {p}')
-    for p in glob.glob(f'{DATA}/hot_*.duckdb'):
-        os.remove(p)
-        print(f'removed {p}')
+    names = sorted(p.name.rsplit('/', 1)[-1] for p in lake.get_paths(FOLDER, recursive=False))
+    old = [n for n in names if n.startswith('hot_')]
+    for f in FILES:
+        old += [n for n in names if n.startswith(f'{f}_') and n.endswith('.duckdb')][:-2]
+    for name in old:
+        lake_file(name).delete_file()
+        print(f'removed {name}')
 
 
+# The lake first: a wrong LAKE_* login fails here, before the long export.
+previous = read_text('source_version.txt')
 version = source_version()
-marker = f'{DATA}/source_version.txt'
-previous = open(marker).read().strip() if os.path.exists(marker) else None
 
 if version == previous:
     print(f'source unchanged ({version}), nothing to rebuild')
 else:
     export()
-    build(datetime.datetime.now().strftime('%Y%m%d_%H%M'))
-    shutil.rmtree(TMP)
-    with open(marker, 'w') as f:
-        f.write(version)
-    print(f'built ({version})')
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d_%H%M')
+    build(ts)
+    publish(ts, version)
+    print(f'published ({version})')

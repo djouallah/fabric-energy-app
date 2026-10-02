@@ -1,0 +1,45 @@
+name: Import Data
+
+# Builds the dashboard's .duckdb files from the analytics-as-code Iceberg catalog and uploads
+# them to the dashboard's lakehouse (import_iceberg.py). The run is skipped inside the script
+# when the catalog has not changed since the last import.
+on:
+  schedule:
+    - cron: '30 22 * * *'  # 8:30am AEST, after analytics-as-code's daily refresh and maintenance
+  workflow_dispatch:
+
+concurrency:
+  group: import-data
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write   # OIDC: the job's identity token is exchanged for OneLake tokens, no secret
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      # Two app registrations, one per tenant; each trusts this repo's main branch.
+      CATALOG_TENANT_ID: ${{ vars.CATALOG_TENANT_ID }}   # reads the Iceberg catalog
+      CATALOG_CLIENT_ID: ${{ vars.CATALOG_CLIENT_ID }}
+      LAKE_TENANT_ID: ${{ vars.LAKE_TENANT_ID }}         # writes the dashboard's lakehouse
+      LAKE_CLIENT_ID: ${{ vars.LAKE_CLIENT_ID }}
+      # The azure extension's default transport fails the OneLake TLS handshake on GitHub runners.
+      AZURE_TRANSPORT_OPTION_TYPE: curl
+      CURL_CA_INFO: /etc/ssl/certs/ca-certificates.crt
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -q duckdb --pre --upgrade
+          pip install -q azure-identity azure-storage-file-datalake
+
+      - name: Import
+        run: python import_iceberg.py
