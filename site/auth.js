@@ -35,7 +35,7 @@ function createNoAuth() {
 // across reloads, so a visitor calls the function about once an hour. Backend URL, key and Fabric coordinates come
 // from the rayfin.config.json that `rayfin up` writes next to the site.
 function createRayfinAuth() {
-  const RENEW_MARGIN_MS = 3 * 60 * 1000;   // re-sign this long before a SAS expires
+  const RENEW_MARGIN_MS = 30 * 1000;       // re-sign this long before a SAS expires
   const DATA_SAS_KEY = 'rayfin_data_sas';
   let _client = null;
   let _fabric = null;
@@ -68,6 +68,9 @@ function createRayfinAuth() {
     if (fresh(_data)) return _data;
     await init();
     _data = await perf.time('sas', 'getDataSas (function call)', () => _client.functions.getDataSas.invoke());
+    // How long the new SAS lives (capped by the function's storage-token expiry) — a short one
+    // means frequent re-attaches.
+    perf.log('info', `SAS valid ${((Date.parse(_data.expiresOn) - Date.now()) / 60000).toFixed(1)} min (expires ${_data.expiresOn})`);
     save(_data);
     return _data;
   }

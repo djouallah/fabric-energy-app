@@ -27,7 +27,10 @@ import { perf, HTTP_TRACE_SHIM } from "./perflog.js";
 export function createDataSource(cfg = {}, auth, { onStatus = () => {} } = {}) {
   const baseUrl = cfg.dataBaseUrl ?? cfg.oneLakeBase ?? '';
   const signed = typeof auth.dataAccess === 'function';
-  const REATTACH_MARGIN_MS = 2 * 60 * 1000;   // re-attach with a fresh SAS this long before expiry
+  // Re-attach only once the SAS has (almost) expired: each re-attach re-reads the db metadata
+  // (~13 serial Range reads, ~10 s), so a generous margin turns a short-lived SAS into a re-attach
+  // on every query. A read that 403s anyway is retried after a forced re-attach (app.js queryDb).
+  const REATTACH_MARGIN_MS = 10 * 1000;
   // An expired/invalid token is a 401; an expired SAS is a 403.
   const authFailed = (resp) => resp.status === 401 || resp.status === 403;
 
@@ -147,7 +150,7 @@ export function createDataSource(cfg = {}, auth, { onStatus = () => {} } = {}) {
   }
 
   // Re-attach with a fresh SAS. `force` after a failed read (e.g. 403); otherwise only when the
-  // current SAS is about to expire. Concurrent callers share one re-attach.
+  // current SAS has expired. Concurrent callers share one re-attach.
   function ensureFresh(force = false) {
     if (!_remote || (!force && Date.now() < _remote.expiresAt - REATTACH_MARGIN_MS)) return Promise.resolve();
     _reattaching ??= (async () => {
