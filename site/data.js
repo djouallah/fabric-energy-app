@@ -4,12 +4,14 @@
 // Given the AuthProvider (auth.js), it:
 //   1. instantiates DuckDB-WASM,
 //   2. resolves the latest import from the OneLake `latest.txt` pointer (data_<ts>.duckdb),
-//   3. downloads the small hot_<ts>.duckdb whole (parallel Range fetches, cached in OPFS by name —
-//      names are immutable) and ATTACHes it from memory as schema `db`:
-//        dim_calendar, dim_duid, fct_daily(DUID,date,mwh,price_sum,price_cnt),
-//        fct_recent(date,time,DUID,mw,price,cutoff)   — the last ~7 days of 5-min rows
+//   3. downloads the small files of that import whole (parallel Range fetches, cached in OPFS by
+//      name — names are immutable) and ATTACHes them from memory under the names the dashboard's
+//      SQL uses:
+//        dim_<ts>.duckdb   as `dim`    dim_calendar, dim_duid
+//        today_<ts>.duckdb as `today`  scada_today, price_today, interconnector_today (last days, 5-min)
+//        agg_<ts>.duckdb   as `agg`    daily and hour-of-day rollups — attachAgg(), after first paint
 //   4. on demand only (attachFull), ATTACHes the full data_<ts>.duckdb in place over HTTP as
-//      schema `full` — fct_summary, all 5-min history, read by Range requests (~700 ms a seek).
+//      `history` — scada and price, all 5-min history, read by Range requests (~700 ms a seek).
 // Every read goes to the OneLake data/ folder with a read-only SAS from the getDataSas function.
 //
 // SAS handling: the full file is registered by a URL without the SAS; a shim in the DuckDB worker
@@ -17,17 +19,17 @@
 // it to the worker, so the hourly rotation never touches an attached database. A read that still
 // fails (403 after sleep/wake, or the "Corrupt database file" it leaves behind in duckdb-wasm's
 // read-ahead cache) is recovered by one DETACH/ATTACH under a new file name, then retried
-// (app.js queryDb).
+// (index.html queryDb).
 //
 // DOM-free: progress is reported through the injected `onStatus` callback.
 // =============================================================================
 
-import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.33.1-dev57.0/+esm";
+import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.33.1-dev65.0/+esm";
 import { perf, HTTP_TRACE_SHIM } from "./perflog.js?v=__BUILD__";
 
 const SAS_CHANNEL = 'duckdb-sas';
 const RENEW_AHEAD_MS = 10 * 60 * 1000;   // renew this long before the SAS expires (covers background-tab timer throttling)
-const CHUNK = 2 * 1024 * 1024;           // hot-file download: Range size per request ...
+const CHUNK = 2 * 1024 * 1024;           // whole-file download: Range size per request ...
 const PARALLEL = 6;                      // ... and how many in flight (a 14 MB file needs small chunks to use them all)
 
 // Prepended to the DuckDB worker (before the trace shim and importScripts): every request under
@@ -85,7 +87,7 @@ export function createDataSource(auth, { onStatus = () => {} } = {}) {
     scheduleRenew(expiresOn);
   }
 
-  // --- Hot file: whole-file download (parallel Ranges) + OPFS cache keyed by the immutable name ---
+  // --- Small files: whole-file download (parallel Ranges) + OPFS cache keyed by the immutable name ---
   async function download(name) {
     const head = await fetch(await signedUrl(name), { method: 'HEAD', cache: 'no-store' });
     if (!head.ok) throw new Error(`HEAD ${name}: HTTP ${head.status}`);
@@ -123,35 +125,44 @@ export function createDataSource(auth, { onStatus = () => {} } = {}) {
       const w = await (await root.getFileHandle(name, { create: true })).createWritable();
       await w.write(bytes);
       await w.close();
-      // One import per browser: drop every other cached .duckdb (previous hot files, old builds).
+      // One import per browser: drop the cached .duckdb files of every other import.
+      const stamp = name.slice(name.indexOf('_'));   // "_<ts>.duckdb"
       for await (const [n] of root.entries()) {
-        if (n !== name && n.endsWith('.duckdb')) await root.removeEntry(n).catch(() => {});
+        if (n.endsWith('.duckdb') && !n.endsWith(stamp)) await root.removeEntry(n).catch(() => {});
       }
     } catch (e) { console.warn('[data] OPFS cache unavailable:', e?.message || e); }
   }
 
-  // Needs no DuckDB: init() starts it while the WASM bundle is still loading.
-  async function loadHot() {
-    fullFile = await resolveLatestDuckDB();
-    const hotName = fullFile.replace(/^data_/, 'hot_');
-    let bytes = await opfsRead(hotName);
+  // One of the import's small files (dim / today / agg), whole. Needs no DuckDB: init() starts
+  // the first two while the WASM bundle is still loading.
+  let _latest = null;   // promise of the data_<ts>.duckdb name
+  async function loadLocal(prefix) {
+    fullFile = await (_latest ??= resolveLatestDuckDB());
+    const name = fullFile.replace(/^data_/, `${prefix}_`);
+    let bytes = await opfsRead(name);
     const source = bytes ? 'OPFS' : 'download';
     if (!bytes) {
-      bytes = await perf.time('fetch', `GET ${hotName} (whole, ${PARALLEL} parallel)`, () => download(hotName));
+      bytes = await perf.time('fetch', `GET ${name} (whole, ${PARALLEL} parallel)`, () => download(name));
       // Awaited: registerFileBuffer transfers (detaches) the buffer to the worker afterwards.
-      await opfsWrite(hotName, bytes);
+      await opfsWrite(name, bytes);
     }
-    perf.log('info', `${hotName}: ${(bytes.length / 1048576).toFixed(1)} MB from ${source}`);
-    return { hotName, bytes };
+    perf.log('info', `${name}: ${(bytes.length / 1048576).toFixed(1)} MB from ${source}`);
+    return { name, bytes };
   }
 
-  async function attachHot({ hotName, bytes }) {
-    onStatus('Opening database...');
-    await db.registerFileBuffer(hotName, bytes);
-    await perf.time('attach', `ATTACH ${hotName} (local)`, () => conn.query(`ATTACH '${hotName}' AS db (READ_ONLY);`));
+  async function attachLocal({ name, bytes }, alias) {
+    await db.registerFileBuffer(name, bytes);
+    await perf.time('attach', `ATTACH ${name} (local)`, () => conn.query(`ATTACH '${name}' AS ${alias} (READ_ONLY);`));
   }
 
-  // --- Full file: remote ATTACH, only when a query needs 5-min rows outside fct_recent ---
+  // The rollups only feed ranges over 30 days: attached after the first paint. One attach,
+  // whoever asks (the background load and the Analyze tab can both call this).
+  let _agg = null;
+  function attachAgg() {
+    return _agg ??= loadLocal('agg').then(f => attachLocal(f, 'agg'));
+  }
+
+  // --- Full file: remote ATTACH, only when a query needs 5-min rows older than the `today` file ---
   let _full = null;          // { name, n }
   let _attachingFull = null;
   let _recovering = null;
@@ -161,7 +172,7 @@ export function createDataSource(auth, { onStatus = () => {} } = {}) {
     // A distinct URL per registration (duckdb-wasm also indexes files by URL); the shim adds the SAS.
     const url = n ? `${dir}/${fullFile}?v=${n}` : `${dir}/${fullFile}`;
     await db.registerFileURL(name, url, duckdb.DuckDBDataProtocol.HTTP, false);
-    await perf.time('attach', `ATTACH ${fullFile} (remote, Range reads)`, () => conn.query(`ATTACH '${name}' AS full (READ_ONLY);`));
+    await perf.time('attach', `ATTACH ${fullFile} (remote, Range reads)`, () => conn.query(`ATTACH '${name}' AS history (READ_ONLY);`));
     const old = _full?.name;
     _full = { name, n };
     if (old) await db.dropFile(old).catch(() => {});
@@ -182,7 +193,7 @@ export function createDataSource(auth, { onStatus = () => {} } = {}) {
       await renew();
       if (!_full) return;
       const { n } = _full;
-      await perf.time('attach', 'DETACH full (recover after failed read)', () => conn.query('DETACH full;'));
+      await perf.time('attach', 'DETACH history (recover after failed read)', () => conn.query('DETACH history;'));
       await attachRemote(n + 1);
     })().finally(() => { _recovering = null; });
     return _recovering;
@@ -194,10 +205,10 @@ export function createDataSource(auth, { onStatus = () => {} } = {}) {
     const access = await auth.dataAccess();
     dir = access.baseUrl;
     scheduleRenew(access.expiresOn);
-    // latest.txt + the hot file don't need DuckDB: fetch them while the WASM bundle boots.
+    // latest.txt + dim + today don't need DuckDB: fetch them while the WASM bundle boots.
     // No fallback: if OneLake is unreachable the dashboard must say so (the await below rethrows).
-    const hot = loadHot();
-    hot.catch(() => {});
+    const local = Promise.all([loadLocal('dim'), loadLocal('today')]);
+    local.catch(() => {});
 
     const JSDELIVR_BUNDLES = duckdb.getJsDelivrBundles();
     const bundle = await duckdb.selectBundle(JSDELIVR_BUNDLES);
@@ -221,11 +232,14 @@ export function createDataSource(auth, { onStatus = () => {} } = {}) {
     await conn.query("SET reliable_head_requests = false;");
 
     onStatus('Downloading data...');
-    await attachHot(await hot);
+    const [dim, today] = await local;
+    onStatus('Opening database...');
+    await attachLocal(dim, 'dim');
+    await attachLocal(today, 'today');
     await conn.query("SET preserve_insertion_order = false;");
 
     return { db, conn };
   }
 
-  return { init, attachFull, recover };
+  return { init, attachAgg, attachFull, recover };
 }
