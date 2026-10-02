@@ -404,6 +404,16 @@
     // year → a month inside it keeps the scan; only widening the range pays a new scan.
     let _baseRange = null;   // { from, to, intraday } the current _base was materialized for
 
+    // Daily grain reads db.fct_daily (DUID, date, mwh, price_sum, price_cnt — written by import.py)
+    // when the file has it: a wide range is then a few MB instead of a scan of the 5-min fact over
+    // HTTP (2018→today = the whole 1.3 GB, minutes). Falls back to rolling up fct_summary otherwise.
+    let _hasDaily = false;
+    async function detectDaily() {
+      const r = await runQuery("SELECT 1 AS ok FROM duckdb_tables() WHERE database_name = 'db' AND table_name = 'fct_daily'");
+      _hasDaily = r.length > 0;
+      perf.log('info', _hasDaily ? 'daily grain: db.fct_daily' : 'daily grain: rollup of db.fct_summary (no fct_daily in file)');
+    }
+
     async function materializeBase() {
       const intraday = isIntradayMode();
       const { from, to } = getDateRange();
@@ -411,21 +421,26 @@
       if (_baseRange && _baseRange.intraday === intraday &&
           from >= _baseRange.from && to <= _baseRange.to) return;
 
-      const time = intraday ? 'f.time,' : '';
-      const val = intraday ? 'SUM(f.mw)::DOUBLE AS mw' : 'CAST(SUM(f.mw)/12.0 AS REAL) AS mwh';
-      const grp = intraday ? 'f.DUID, f.date, f.time' : 'f.DUID, f.date';
+      const dims = 'd.Region, d.FuelSourceDescriptor AS fuel, d.latitude AS lat, d.longitude AS lon';
+      let body;
+      if (!intraday && _hasDaily) {
+        body = `SELECT f.DUID, f.date, ${dims}, f.mwh, f.price_sum, f.price_cnt
+                FROM db.fct_daily f JOIN db.dim_duid d ON f.DUID = d.DUID
+                WHERE f.date >= '${from}' AND f.date <= '${to}'`;
+      } else {
+        const time = intraday ? 'f.time,' : '';
+        const val = intraday ? 'SUM(f.mw)::DOUBLE AS mw' : 'CAST(SUM(f.mw)/12.0 AS REAL) AS mwh';
+        const grp = intraday ? 'f.DUID, f.date, f.time' : 'f.DUID, f.date';
+        body = `SELECT f.DUID, f.date, ${time} ${dims},
+                       ${val},
+                       SUM(f.price) AS price_sum, COUNT(f.price) AS price_cnt
+                FROM db.fct_summary f JOIN db.dim_duid d ON f.DUID = d.DUID
+                WHERE f.date >= '${from}' AND f.date <= '${to}'
+                GROUP BY ${grp}, d.Region, d.FuelSourceDescriptor, d.latitude, d.longitude`;
+      }
       // noCache: a side-effecting DDL that must run when called; the containment guard above is
       // what prevents redundant rebuilds (caching its empty result would be a staleness hazard).
-      await runQuery(`
-        CREATE OR REPLACE TABLE _base AS
-        SELECT f.DUID, f.date, ${time} d.Region, d.FuelSourceDescriptor AS fuel,
-               d.latitude AS lat, d.longitude AS lon,
-               ${val},
-               SUM(f.price) AS price_sum, COUNT(f.price) AS price_cnt
-        FROM db.fct_summary f JOIN db.dim_duid d ON f.DUID = d.DUID
-        WHERE f.date >= '${from}' AND f.date <= '${to}'
-        GROUP BY ${grp}, d.Region, d.FuelSourceDescriptor, d.latitude, d.longitude`,
-        { noCache: true });
+      await runQuery(`CREATE OR REPLACE TABLE _base AS ${body}`, { noCache: true });
       _baseRange = { from, to, intraday };
     }
 
@@ -1229,6 +1244,7 @@
       const { db, conn: c } = await data.init();
       _db = db;
       conn = c;
+      await detectDaily();
       await populateFilters();
       await renderAll();
     }
