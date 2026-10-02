@@ -34,6 +34,8 @@ This is an experiment. Read these before you copy it:
   query blocks until it finishes, and more cores do not help. This may change in the future.
 - **Limited by the browser.** A tab gets about 4 GB of memory; a query that needs more fails. Phones
   and old laptops will struggle.
+- **No semantic model.** Measures and relationships are not defined once and reused. Every chart's
+  data comes from handwritten SQL, so a metric is written wherever it is used.
 
 ## Setup
 
