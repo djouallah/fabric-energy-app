@@ -3,7 +3,10 @@
      Same dashboard; only hosting and data loading differ, and every local change is marked FABRIC.
      To pick up upstream changes (run in this repo):
        git -C <analytics-as-code> diff a3b1429..HEAD -- dashboard/index.html | git apply -p2 --directory=site
-     then update the sha above. -->
+     then update the sha above.
+     Ahead of upstream until ported there: generators on the Flows map, KPI sparklines and
+     deltas, the History tab, the Batteries and ownership charts, date presets. None of it is
+     FABRIC-specific; the command above may need a manual merge until then. -->
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -121,6 +124,8 @@
     .flows-bar { display: flex; align-items: center; gap: 0.8rem; padding: 0.6rem 2rem 0.2rem; flex-wrap: wrap; }
     .flows-time { font-size: 1.6rem; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; min-width: 12rem; }
     .flows-time small { display: block; font-size: 0.7rem; font-weight: 500; color: var(--muted); letter-spacing: 0; }
+    .flows-now { display: block; font-size: 0.85rem; font-weight: 600; letter-spacing: 0; min-height: 1.2em; }
+    .flows-now b { color: #3fb950; }
     .flows-bar input[type=range] { flex: 1; min-width: 160px; accent-color: var(--accent); }
     .flows-btn { background: var(--card); border: 1px solid var(--border); border-radius: 6px; color: var(--text); cursor: pointer; font-size: 0.8rem; font-weight: 600; padding: 0.35rem 0.8rem; }
     .flows-btn:hover { border-color: var(--accent); color: var(--accent); }
@@ -242,11 +247,12 @@
 
   <div id="view-flows" role="tabpanel" aria-labelledby="tab-flows" style="display:none">
     <div class="flows-bar">
-      <div class="flows-time" id="flowsTime">--<small id="flowsTimeSub">Power flow between regions (MW) and spot price ($/MWh) in this 5-minute interval</small></div>
+      <div class="flows-time" id="flowsTime">--<span class="flows-now" id="flowsNow"></span><small id="flowsTimeSub">Generators, power flow between regions (MW) and spot price ($/MWh) in this 5-minute interval</small></div>
       <button type="button" class="flows-btn" id="icPlay" aria-label="Play the flows through the selected range">&#9654; Play</button>
       <label class="chart-toggle" for="icSpeed">Speed</label>
       <select id="icSpeed"><option value="0.5">0.5&times;</option><option value="1" selected>1&times;</option><option value="2">2&times;</option><option value="4">4&times;</option></select>
       <input type="range" id="icFrame" min="0" max="0" value="0" aria-label="Dispatch interval shown">
+      <label class="chart-toggle"><input type="checkbox" id="icGens" checked> Generators</label>
     </div>
     <div class="flows-main">
       <div class="chart-card">
@@ -265,7 +271,9 @@
       MW is power at that moment; $/MWh is the wholesale spot price, not the cost of the flow.
       AEMO 5-minute dispatch, last 14 days. Arrows point the way power flows; their thickness is the
       flow and their colour how close the link runs to its limit (green &lt; 70% &le; amber &lt; 90%
-      &le; red). Regions are shaded by their price in that interval. In the small charts the band is
+      &le; red). Regions are shaded by their price in that interval. Bubbles are the generating
+      units, sized by their output in that interval and coloured by fuel; a ring is a unit
+      charging (batteries, pumped hydro). In the small charts the band is
       the link's import&ndash;export limit and the line the flow, positive from the first region in
       the name to the second. Hover any small chart to move the map; Play steps through the range.
     </p>
@@ -1281,7 +1289,51 @@
     const fmtPrice = (v, dp = 0) => v == null ? '--' : `${v < 0 ? '-' : ''}$${Math.abs(v).toFixed(dp)}`;
     const priceColor = v => v == null ? '#888' : PRICE_BANDS.find(b => (b.gte == null || v >= b.gte) && (b.lt == null || v < b.lt)).color;
 
-    const icState = { frames: [], flows: new Map(), prices: new Map(), frame: 0, timer: null, ids: [] };
+    const icState = { frames: [], flows: new Map(), prices: new Map(), frame: 0, timer: null, ids: [],
+      gens: new Map(), gensLoading: new Set() };
+
+    // Generators on the flow map. Every unit's fuel, region and position once; their output one
+    // day at a time, one row per interval ("DUID:mw,DUID:mw,..."), straight from the 14-day file.
+    const GEN_FULL_MW = 750;   // output drawn at the largest bubble size
+    const GEN_LEGEND = ['Black coal', 'Brown coal', 'Natural gas', 'Water', 'Wind', 'Solar', 'Grid'];
+    let _genUnits = null;
+    async function genUnits() {
+      _genUnits ??= new Map((await runQuery(`SELECT DUID, FuelSourceDescriptor AS fuel, Region,
+        latitude::DOUBLE AS lat, longitude::DOUBLE AS lon FROM dim.dim_duid`)).map(u => [u.DUID, u]));
+      return _genUnits;
+    }
+    async function ensureGens(date) {
+      if (icState.gens.has(date) || icState.gensLoading.has(date)) return;
+      icState.gensLoading.add(date);
+      try {
+        const [rows] = await Promise.all([runQuery(`
+          SELECT CAST(time AS INTEGER) AS time,
+            string_agg(DUID || ':' || CAST(CAST(ROUND(mw) AS INTEGER) AS VARCHAR), ',') AS g
+          FROM today.scada_today WHERE date = ${sqlStr(date)} AND abs(mw) >= 1 GROUP BY time`), genUnits()]);
+        icState.gens.set(date, new Map(rows.map(r => [padTime(r.time), r.g])));
+      } catch (e) {
+        console.warn('[Flows] generators unavailable:', e);
+        icState.gens.set(date, new Map());
+      } finally {
+        icState.gensLoading.delete(date);
+      }
+      // Draw them if the map is still on that day.
+      if (document.getElementById('view-flows').style.display !== 'none'
+        && icState.frames[icState.frame]?.key.startsWith(date + '|')) icShow(icState.frame);
+    }
+    // The units of one interval as { duid, mw, unit }, within the region filter.
+    function frameGens(packed) {
+      if (!packed) return [];
+      const region = activeRegion();
+      const out = [];
+      for (const part of packed.split(',')) {
+        const i = part.lastIndexOf(':');
+        const duid = part.slice(0, i), unit = _genUnits.get(duid);
+        if (region && unit?.Region !== region) continue;
+        out.push({ duid, mw: +part.slice(i + 1), unit });
+      }
+      return out;
+    }
 
     async function renderFlows(seq) {
       icStop();
@@ -1307,6 +1359,7 @@
         for (const id of Object.keys(charts).filter(k => k.startsWith('chart-mini-'))) { charts[id].dispose(); delete charts[id]; }
         minis.innerHTML = '';
         document.getElementById('flowsTime').firstChild.textContent = '--';
+        document.getElementById('flowsNow').textContent = '';
         icState.frames = [];
         return;
       }
@@ -1337,6 +1390,8 @@
         `<div><b>Arrows</b> power flowing now (MW), thicker = more; colour = share of the link's limit ` +
           [[0, '&lt; 70%'], [0.7, '70&ndash;90%'], [0.9, '&ge; 90%']].map(([u, l]) => swatch(utilColor(u), l)).join(' ') + '</div>' +
         `<div><b>Dots</b> ${swatch('#3fb950', 'net exporter')} ${swatch('#f0883e', 'net importer')}</div>` +
+        `<div><b>Bubbles</b> generators, sized by output; ring = charging ` +
+          GEN_LEGEND.map(f => swatch(fuelColor(f), f === 'Grid' ? 'Battery' : f)).join(' ') + '</div>' +
         `<div><b>Shading</b> spot price ($/MWh) ` + PRICE_BANDS.map(b => swatch(b.color, b.label)).join(' ') + '</div>';
       icState.ids = Object.keys(INTERCONNECTORS).filter(id => shown.some(r => r.id === id));
 
@@ -1398,6 +1453,25 @@
       document.getElementById('flowsTime').firstChild.textContent = label + ' ';
       const rows = icState.flows.get(key) ?? [];
       const price = code => icState.prices.get(`${key}|${code}`);
+
+      // --- generators in this interval (loaded a day at a time, the next day ahead of play) ---
+      const [day, hhmm] = key.split('|');
+      let gens = [];
+      if (document.getElementById('icGens').checked) {
+        if (icState.gens.has(day)) gens = frameGens(icState.gens.get(day).get(hhmm));
+        else ensureGens(day);
+        ensureGens(icState.frames[Math.min(icState.frame + 288, icState.frames.length - 1)].key.split('|')[0]);
+      }
+      // Same definition as the Renewables KPI: output only, batteries on neither side.
+      let genMw = 0, reMw = 0;
+      for (const g of gens) {
+        if (g.mw <= 0 || g.unit?.fuel === 'Grid') continue;
+        genMw += g.mw;
+        if (RENEWABLE_FUELS.includes(g.unit?.fuel)) reMw += g.mw;
+      }
+      document.getElementById('flowsNow').innerHTML = genMw
+        ? `${Math.round(genMw).toLocaleString()} MW generating &middot; <b>${Math.round(100 * reMw / genMw)}%</b> renewable`
+        : '';
       const net = {};   // + exporting, - importing
       for (const r of rows) {
         const ic = INTERCONNECTORS[r.id];
@@ -1434,6 +1508,7 @@
         tooltip: { trigger: 'item', formatter: p => {
           if (p.seriesType === 'lines') return `<b>${p.data.name}</b> ${p.data.dir}<br>${p.data.value.toLocaleString()} MW &middot; ${Math.round(100 * p.data.util)}% of limit`;
           if (p.seriesType === 'effectScatter') return `<b>${regionName(p.name)}</b><br>${p.value[2] >= 0 ? 'exporting' : 'importing'} ${Math.abs(p.value[2]).toLocaleString()} MW`;
+          if (p.seriesType === 'scatter') return `<b>${escapeHtml(p.name)}</b><br>${escapeHtml(p.data.fuel)} &middot; ${Math.abs(p.value[2]).toLocaleString()} MW${p.value[2] < 0 ? ' charging' : ''}`;
           return '';
         } },
         geo: { map: 'australia', nameProperty: 'STATE_NAME', roam: true, center: [145.4, -31.8], zoom: 1.85,
@@ -1448,6 +1523,13 @@
           regions: Object.entries(STATE_REGION).map(([state, code]) => ({
             name: state, itemStyle: { areaColor: price(code) == null ? (light ? '#dfe5ec' : '#2b3446') : priceColor(price(code)), opacity: light ? 0.75 : 0.55 } })) },
         series: [
+          { type: 'scatter', coordinateSystem: 'geo', zlevel: 1, animation: false,
+            symbolSize: v => 3 + 20 * Math.sqrt(Math.min(1, Math.abs(v[2]) / GEN_FULL_MW)),
+            data: gens.filter(g => g.unit?.lat != null && g.unit.lon != null).map(g => {
+              const fuel = g.unit.fuel ?? 'Unknown', color = fuelColor(fuel);
+              return { name: g.duid, fuel, value: [g.unit.lon, g.unit.lat, g.mw],
+                itemStyle: g.mw < 0 ? { color: 'transparent', borderColor: color, borderWidth: 1.5 } : { color, opacity: 0.8 } };
+            }) },
           { type: 'lines', coordinateSystem: 'geo', zlevel: 2,
             effect: { show: true, period: 2.5, trailLength: 0.2, symbol: 'arrow', symbolSize: 11, color: light ? '#1f2328' : '#ffffff' },
             label: { show: true, position: 'middle', fontSize: 11, fontWeight: 600, color: light ? '#1f2328' : '#ffffff',
@@ -1496,6 +1578,7 @@
       if (icState.timer) { icStop(); document.getElementById('icPlay').click(); }
     });
     document.getElementById('icFrame').addEventListener('input', e => { icStop(); icShow(+e.target.value); });
+    document.getElementById('icGens').addEventListener('change', () => icShow(icState.frame));
 
     async function renderRenewables(seq) {
       const intraday = isIntradayMode();
