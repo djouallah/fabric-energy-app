@@ -46,8 +46,6 @@ You need a Fabric workspace with a lakehouse:
   identity's permissions.
 - After the first `rayfin up`, store the lakehouse Files URL as a Rayfin secret:
   `echo https://onelake.dfs.fabric.microsoft.com/<ws>/<lh>.Lakehouse/Files | npx rayfin secret set ONELAKE_FILES_URL --stdin`
-- `cp site/config.example.js site/config.js` (`auth: "rayfin"` needs no ids — they come from the
-  `rayfin.config.json` that `rayfin up` writes).
 
 Everything else is Rayfin — see the [Rayfin documentation](https://learn.microsoft.com/fabric/embedded/rayfin/overview) for full details:
 
@@ -57,7 +55,8 @@ rayfin up         # build (build.mjs) + deploy dist/ to Fabric static hosting; p
 ```
 
 `rayfin.yml` is already wired (`data.enabled: false`, `functions.enabled: true`,
-`staticHosting.buildCommand: npm run build:fabric`), so it's just `rayfin up`. Upload your `data.duckdb`
-to `<oneLakeBase>/data/data.duckdb` in the lakehouse (the dashboard fetches it from exactly that path).
+`staticHosting.buildCommand: npm run build:fabric`), so it's just `rayfin up`. Upload your `.duckdb`
+to `Files/data/` in the lakehouse and write its filename into `Files/data/latest.txt` (the dashboard
+attaches whatever that pointer names).
 Open it inside the Fabric portal or in its own tab (one Fabric sign-in click there).
 

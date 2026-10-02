@@ -29,9 +29,6 @@ rayfin/.env*
 rayfin/.deployments.json
 rayfin/.temp/
 
-# Local deployment config (tenant/workspace identifiers) — copy site/config.example.js to site/config.js
-site/config.js
-
 # Claude Code harness config (local)
 .claude/
 
@@ -43,7 +40,7 @@ AGENTS.md
 # Local design docs — kept on disk, not shipped to the deploy repo
 /docs/
 
-# Local analysis artifacts (NOT data.duckdb — that's the tracked demo fallback DB)
+# Local analysis artifacts
 query_log*.csv
 
 # Editor / OS

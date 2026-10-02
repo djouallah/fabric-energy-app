@@ -1230,10 +1230,9 @@
       await renderAll();
     }
 
-    // --- Providers: auth + data implementations are selected by config.js (see auth.js / data.js). ---
-    const cfg = window.RAYFIN_WASM_CONFIG || {};
-    const auth = createAuth(cfg);
-    const data = createDataSource(cfg, auth, { onStatus: setStatus });
+    // --- Providers: Rayfin Fabric SSO (auth.js) + OneLake-attached DuckDB (data.js). ---
+    const auth = createAuth();
+    const data = createDataSource(auth, { onStatus: setStatus });
 
     // Render the sign-in button into the auth gate — the Fabric sign-in popup needs a user gesture.
     function showSignIn(onDone) {
@@ -1249,9 +1248,8 @@
       };
     }
 
-    // Gate. No-auth mode: ensureSession() is always true -> straight in. Rayfin: the silent check
-    // covers a stored session and the Fabric iframe handoff; a standalone tab with no session gets
-    // the sign-in button.
+    // Gate. The silent check covers a cached SAS, a stored session and the Fabric iframe handoff;
+    // a standalone tab with no session gets the sign-in button.
     try {
       if (await auth.ensureSession(false)) {
         document.getElementById('authGate').style.display = 'none';

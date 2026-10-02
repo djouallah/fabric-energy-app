@@ -1,15 +1,11 @@
 // =============================================================================
-// auth.js — AuthProvider abstraction (presentation/data agnostic)
+// auth.js — AuthProvider: Rayfin Fabric SSO + a scoped OneLake SAS
 // =============================================================================
-// One interface, two implementations selected by config:
-//   'rayfin' -> Rayfin Fabric SSO + a function that returns a scoped OneLake SAS (default)
-//   'none'   -> no auth at all (plain static hosting, same-origin/public data)
-//
 // DOM-free: the dashboard (app.js) owns all UI, including the sign-in gate.
 //
-//   const auth = createAuth(cfg);
+//   const auth = createAuth();
 //   if (await auth.ensureSession(false)) { /* signed in */ }
-//   auth.dataAccess?.()  -> { baseUrl, sas }   (rayfin only; data.js uses it when present)
+//   auth.dataAccess()  -> { baseUrl, sas, expiresOn }   (data.js reads OneLake with it)
 // =============================================================================
 
 // Keep these on the same version: jsDelivr resolves their shared deps (rayfin-auth, rayfin-lib)
@@ -18,16 +14,6 @@ import { perf } from './perflog.js';
 
 const RAYFIN_CLIENT_ESM = "https://cdn.jsdelivr.net/npm/@microsoft/rayfin-client@1.36.1/+esm";
 const RAYFIN_FABRIC_ESM = "https://cdn.jsdelivr.net/npm/@microsoft/rayfin-auth-provider-fabric@1.36.1/+esm";
-
-// --- No-auth provider: everything is already accessible. ---
-function createNoAuth() {
-  return {
-    mode: 'none',
-    async ensureSession() { return true; },
-    getHeaders() { return {}; },
-    async refresh() { return true; },
-  };
-}
 
 // --- Rayfin provider: Fabric SSO session (no second login; inside the Fabric portal iframe the
 // session is handed over by postMessage). The browser never holds a storage token: the getDataSas function (rayfin/functions)
@@ -86,9 +72,7 @@ function createRayfinAuth() {
   }
 
   return {
-    mode: 'rayfin',
     ensureSession,
-    getHeaders() { return {}; },
     dataAccess,
     // Drop cached SAS (e.g. after a 403) so the next call re-signs.
     async refresh() {
@@ -99,7 +83,4 @@ function createRayfinAuth() {
   };
 }
 
-// Pick the provider: 'none' for plain static hosting, otherwise Rayfin.
-export function createAuth(cfg = {}) {
-  return cfg.auth === 'none' ? createNoAuth() : createRayfinAuth();
-}
+export const createAuth = createRayfinAuth;

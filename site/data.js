@@ -1,19 +1,12 @@
 // =============================================================================
 // data.js — DataSource: bring up DuckDB-WASM with `db` attached
 // =============================================================================
-// Platform-agnostic data loading. Given an AuthProvider (auth.js) and config, it:
+// Given the AuthProvider (auth.js), it:
 //   1. instantiates DuckDB-WASM,
-//   2. resolves the latest .duckdb file (OneLake `latest.txt` pointer, if any),
-//   3. rayfin: ATTACHes the OneLake file in place over HTTP — DuckDB reads only the blocks a query
-//      touches (Range requests); nothing is downloaded up front.
-//      otherwise: fetches + OPFS-caches it (conditional GET via ETag) and ATTACHes the local copy.
-//   The attachment is always schema `db` (READ_ONLY).
-//
-// Where the file comes from:
-//   auth.dataAccess present (rayfin) -> OneLake data/ folder + a read-only SAS from the backend.
-//   else cfg.dataBaseUrl ?? cfg.oneLakeBase ?? '':
-//     non-empty -> fetch `<base>/data/<file>.duckdb` with auth headers.
-//     ''        -> same-origin `./data/data.duckdb`, no auth (bundled / public static host).
+//   2. resolves the latest .duckdb file from the OneLake `latest.txt` pointer,
+//   3. ATTACHes that OneLake file in place over HTTP (READ_ONLY, schema `db`) — DuckDB reads only
+//      the blocks a query touches (Range requests); nothing is downloaded up front.
+// Both reads go to the OneLake data/ folder with a read-only SAS from the getDataSas function.
 //
 // Contract: after init(), schema `db` exists with
 //   fct_summary(date,time,DUID,mw,price,cutoff), dim_duid(...), dim_calendar(...).
@@ -24,114 +17,39 @@
 import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.33.1-dev57.0/+esm";
 import { perf, HTTP_TRACE_SHIM } from "./perflog.js";
 
-export function createDataSource(cfg = {}, auth, { onStatus = () => {} } = {}) {
-  const baseUrl = cfg.dataBaseUrl ?? cfg.oneLakeBase ?? '';
-  const signed = typeof auth.dataAccess === 'function';
-  // An expired/invalid token is a 401; an expired SAS is a 403.
-  const authFailed = (resp) => resp.status === 401 || resp.status === 403;
-
-  // Cache a remote .duckdb file in OPFS using the file's ETag for freshness.
-  // OneLake honors conditional GETs, so on every load we send If-None-Match:
-  //   304 -> file unchanged, use the OPFS copy (no download)
-  //   200 -> file changed (or first load) -> download + store new ETag
-  // => a plain refresh automatically picks up new data; no manual versioning.
-  // `renewUrl` (optional) re-signs the URL after an auth failure; otherwise the same URL is retried
-  // with refreshed auth headers.
-  // source: 'opfs-hit' | 'opfs-miss' | 'opfs-refresh'
-  async function cacheInOPFS(db, url, filename, renewUrl) {
-    const root = await navigator.storage.getDirectory();
-    const etagKey = `opfs_etag_${filename}`;
-    const cachedEtag = localStorage.getItem(etagKey);
-
-    const doFetch = (conditional) => {
-      const headers = auth.getHeaders();
-      if (conditional && cachedEtag) headers['If-None-Match'] = cachedEtag;
-      return fetch(url, { headers });
-    };
-
-    const renew = async () => { await auth.refresh(); if (renewUrl) url = await renewUrl(); };
-
-    onStatus("Checking for updates...");
-    let resp = await doFetch(true);
-    if (authFailed(resp)) { await renew(); resp = await doFetch(true); }
-
-    // Unchanged -> reuse the OPFS copy.
-    if (resp.status === 304) {
-      try {
-        const handle = await root.getFileHandle(filename);
-        const file = await handle.getFile();
-        console.log(`[OPFS] ${filename} unchanged (304), using cache (${(file.size/1048576).toFixed(1)} MB)`);
-        await db.registerFileBuffer(filename, new Uint8Array(await file.arrayBuffer()));
-        return { source: 'opfs-hit' };
-      } catch (e) {
-        console.log(`[OPFS] 304 but no OPFS copy for ${filename}, re-downloading`);
-        resp = await doFetch(false); // unconditional
-        if (authFailed(resp)) { await renew(); resp = await doFetch(false); }
-      }
-    }
-
-    if (!resp.ok) throw new Error(`Failed to fetch ${filename}: HTTP ${resp.status}`);
-    onStatus("Downloading database...");
-    const buffer = new Uint8Array(await resp.arrayBuffer());
-    if (buffer.byteLength < 100) throw new Error(`${filename} is too small (${buffer.byteLength} bytes), likely not a valid database`);
-    const sizeMB = (buffer.byteLength / 1024 / 1024).toFixed(1);
-
-    const handle = await root.getFileHandle(filename, { create: true });
-    const writable = await handle.createWritable();
-    await writable.write(buffer);
-    await writable.close();
-    const newEtag = resp.headers.get('ETag');
-    if (newEtag) localStorage.setItem(etagKey, newEtag); else localStorage.removeItem(etagKey);
-    console.log(`[OPFS] Downloaded ${filename} (${sizeMB} MB)`);
-
-    await db.registerFileBuffer(filename, buffer);
-    return { source: cachedEtag ? 'opfs-refresh' : 'opfs-miss' };
-  }
-
-  // URL of a file in the data folder: SAS-signed (rayfin) or `<baseUrl>/data/<name>` + auth headers.
-  async function dataUrl(name) {
-    if (!signed) return `${baseUrl}/data/${name}`;
-    const { baseUrl: dir, sas } = await auth.dataAccess();
-    return `${dir}/${name}?${sas}`;
-  }
-
-  // Resolve the moving `latest.txt` pointer to a concrete db filename. Same-origin
-  // (no baseUrl) has no pointer — always 'data.duckdb'.
+export function createDataSource(auth, { onStatus = () => {} } = {}) {
+  // Resolve the moving `latest.txt` pointer to a concrete db filename.
   async function resolveLatestDuckDB() {
-    if (!signed && !baseUrl) return 'data.duckdb';
+    // no-store: latest.txt is a moving pointer; a cached copy would resolve to a stale db
+    // filename and the dashboard would never pick up a fresh import.
+    const fetchLatest = async () => {
+      const { baseUrl: dir, sas } = await auth.dataAccess();
+      const t = performance.now();
+      const r = await fetch(`${dir}/latest.txt?${sas}`, { cache: 'no-store' });
+      perf.log('fetch', 'GET latest.txt', { ms: performance.now() - t, status: r.status });
+      return r;
+    };
+    let resp = await fetchLatest();
+    if (resp.status === 403) { await auth.refresh(); resp = await fetchLatest(); }   // expired SAS
+    if (!resp.ok) throw new Error(`Failed to read data/latest.txt: HTTP ${resp.status}`);
+    const fname = (await resp.text()).trim();
+    if (!fname) throw new Error('data/latest.txt is empty');
+    console.log(`[data] latest db: ${fname}`);
+    return fname;
+  }
+
+  // Free the full .duckdb copies that earlier (download-to-OPFS) versions left in this browser.
+  async function evictOPFSCopies() {
     try {
-      // no-store: latest.txt is a moving pointer; a cached copy would resolve to a stale db
-      // filename and the dashboard would never pick up a fresh import.
-      const fetchLatest = async () => {
-        const url = await dataUrl('latest.txt');
-        const t = performance.now();
-        const r = await fetch(url, { headers: auth.getHeaders(), cache: 'no-store' });
-        perf.log('fetch', 'GET latest.txt', { ms: performance.now() - t, status: r.status });
-        return r;
-      };
-      let resp = await fetchLatest();
-      if (authFailed(resp)) { await auth.refresh(); resp = await fetchLatest(); }
-      if (!resp.ok) return 'data.duckdb';
-      const fname = (await resp.text()).trim();
-      console.log(`[data] latest db: ${fname}`);
-      return fname || 'data.duckdb';
-    } catch (e) {
-      console.warn('[data] latest.txt read failed:', e.message);
-      return 'data.duckdb';
-    }
-  }
-
-  async function evictOldDuckDBs(keep) {
-    const root = await navigator.storage.getDirectory();
-    for await (const [name] of root.entries()) {
-      if (/^data.*\.duckdb$/.test(name) && name !== keep) {
-        await root.removeEntry(name).catch(() => {});
+      const root = await navigator.storage.getDirectory();
+      for await (const [name] of root.entries()) {
+        if (/^data.*\.duckdb$/.test(name)) await root.removeEntry(name).catch(() => {});
       }
-    }
+    } catch (e) { /* no OPFS: nothing to free */ }
   }
 
-  // Remote attach (rayfin): attach once. The SAS (55 min) is part of the file URL; when a read
-  // fails with 403 the caller forces one re-attach with a fresh SAS and retries (~1/hour).
+  // Attach once. The SAS (55 min) is part of the file URL; when a read fails with 403 the caller
+  // forces one re-attach with a fresh SAS and retries (~1/hour).
   let _remote = null;        // { db, conn, file, name, n }
   let _reattaching = null;
 
@@ -182,22 +100,12 @@ export function createDataSource(cfg = {}, auth, { onStatus = () => {} } = {}) {
     // size from the HEAD Content-Length and uses Range reads.
     await conn.query("SET reliable_head_requests = false;");
 
-    // No fallback to a bundled copy: if OneLake is unreachable the dashboard must say so, not
-    // silently show stale demo data.
+    // No fallback: if OneLake is unreachable the dashboard must say so.
     const dbFile = await resolveLatestDuckDB();
-    if (signed) {
-      onStatus("Opening database...");
-      await attachRemote(db, conn, dbFile);
-      await evictOldDuckDBs(null);   // free the full copies earlier versions kept in OPFS
-      console.log(`[data] ${dbFile}: attached remotely (HTTP range reads)`);
-    } else {
-      const url = baseUrl ? await dataUrl(dbFile) : './data/data.duckdb';
-      const dbResult = await cacheInOPFS(db, url, dbFile);
-      await evictOldDuckDBs(dbFile);
-      await conn.query(`ATTACH '${dbFile}' AS db (READ_ONLY);`);
-      const sourceLabel = { 'opfs-hit': 'cached', 'opfs-miss': 'downloaded', 'opfs-refresh': 'refreshed' };
-      console.log(`[OPFS] ${dbFile}: ${sourceLabel[dbResult.source]}`);
-    }
+    onStatus("Opening database...");
+    await attachRemote(db, conn, dbFile);
+    await evictOPFSCopies();
+    console.log(`[data] ${dbFile}: attached remotely (HTTP range reads)`);
     await conn.query("SET preserve_insertion_order = false;");
 
     return { db, conn };
