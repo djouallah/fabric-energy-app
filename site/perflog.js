@@ -10,6 +10,9 @@
 // Timestamps are absolute (performance.timeOrigin + now) so worker and page events line up.
 // =============================================================================
 
+// Stamped by build.mjs (git sha + build time). Shown in the Logs tab so a cached bundle is obvious.
+export const BUILD = '__BUILD__';
+
 const CHANNEL = 'perflog-http';
 const MAX_EVENTS = 5000;
 const events = [];

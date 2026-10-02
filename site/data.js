@@ -21,7 +21,7 @@
 // =============================================================================
 
 import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.33.1-dev57.0/+esm";
-import { perf, HTTP_TRACE_SHIM } from "./perflog.js";
+import { perf, HTTP_TRACE_SHIM } from "./perflog.js?v=__BUILD__";
 
 const SAS_CHANNEL = 'duckdb-sas';
 const RENEW_AHEAD_MS = 10 * 60 * 1000;   // renew this long before the SAS expires (covers background-tab timer throttling)

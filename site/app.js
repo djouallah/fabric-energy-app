@@ -1,6 +1,6 @@
-    import { createAuth } from './auth.js';
-    import { perf } from './perflog.js';
-    import { createDataSource } from './data.js';
+    import { createAuth } from './auth.js?v=__BUILD__';
+    import { perf, BUILD } from './perflog.js?v=__BUILD__';
+    import { createDataSource } from './data.js?v=__BUILD__';
 
     // =========================================================================
     // 1. CONSTANTS & THEME
@@ -106,6 +106,8 @@
     async function queryDb(c, sqlStr) {
       try { return await c.query(sqlStr); }
       catch (e) {
+        // Logs tab: WHAT failed and why (only successful queries are logged by runQuery).
+        perf.log('error', sqlStr.replace(/\s+/g, ' ').trim(), { status: String(e?.message || e) });
         if (!/\b403\b|HTTP|Corrupt database file/i.test(String(e?.message))) throw e;
         await data.recover();
         return c.query(sqlStr);
@@ -785,6 +787,7 @@
       const kb = (a) => a.reduce((s, e) => s + (e.bytes || 0), 0) / 1024;
       const pct = (a, p) => { const v = a.map(e => e.ms).sort((x, y) => x - y); return v.length ? v[Math.min(v.length - 1, Math.floor(p * v.length))] : 0; };
       document.getElementById('logsSummary').textContent = [
+        `build         : ${BUILD}`,
         `HTTP requests : ${http.length}  (Range reads/seeks: ${reads.length})   ${(kb(http) / 1024).toFixed(1)} MB`,
         `seek latency  : avg ${(ms(reads) / (reads.length || 1)).toFixed(0)} ms   p50 ${pct(reads, 0.5).toFixed(0)} ms   p95 ${pct(reads, 0.95).toFixed(0)} ms   max ${pct(reads, 1).toFixed(0)} ms   sum ${(ms(reads) / 1000).toFixed(1)} s`,
         `SAS calls     : ${sum('sas').length}  (${ms(sum('sas')).toFixed(0)} ms)    ATTACH: ${ms(sum('attach')).toFixed(0)} ms    queries: ${sum('query').length}  (${(ms(sum('query')) / 1000).toFixed(1)} s)`,
@@ -1101,6 +1104,7 @@
           alert('Export capped at 1,000,000 rows. Apply filters or reduce the date range for complete data.');
         }
       } catch (e) {
+        perf.log('error', 'CSV export', { status: String(e?.message || e) });
         if (e.message && e.message.includes('Out of Memory')) {
           setStatus("Export failed: out of memory", "error");
           alert('Out of memory. Apply filters (region, fuel, DUID) or reduce the date range.');
@@ -1230,6 +1234,7 @@
     }
 
     // --- Providers: Rayfin Fabric SSO (auth.js) + OneLake-attached DuckDB (data.js). ---
+    perf.log('info', `build ${BUILD}`);
     const auth = createAuth();
     const data = createDataSource(auth, { onStatus: setStatus });
 
