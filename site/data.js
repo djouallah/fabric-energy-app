@@ -27,10 +27,6 @@ import { perf, HTTP_TRACE_SHIM } from "./perflog.js";
 export function createDataSource(cfg = {}, auth, { onStatus = () => {} } = {}) {
   const baseUrl = cfg.dataBaseUrl ?? cfg.oneLakeBase ?? '';
   const signed = typeof auth.dataAccess === 'function';
-  // Re-attach only once the SAS has (almost) expired: each re-attach re-reads the db metadata
-  // (~13 serial Range reads, ~10 s), so a generous margin turns a short-lived SAS into a re-attach
-  // on every query. A read that 403s anyway is retried after a forced re-attach (app.js queryDb).
-  const REATTACH_MARGIN_MS = 10 * 1000;
   // An expired/invalid token is a 401; an expired SAS is a 403.
   const authFailed = (resp) => resp.status === 401 || resp.status === 403;
 
@@ -134,28 +130,29 @@ export function createDataSource(cfg = {}, auth, { onStatus = () => {} } = {}) {
     }
   }
 
-  // Remote attach (rayfin): the SAS is part of the file URL, so before it expires the file is
-  // re-registered under a new name with a fresh SAS and re-ATTACHed (metadata re-read, ~1/hour).
-  let _remote = null;        // { db, conn, file, name, n, expiresAt }
+  // Remote attach (rayfin): attach once. The SAS (55 min) is part of the file URL; when a read
+  // fails with 403 the caller forces one re-attach with a fresh SAS and retries (~1/hour).
+  let _remote = null;        // { db, conn, file, name, n }
   let _reattaching = null;
 
   async function attachRemote(db, conn, file, n = 0) {
-    const { baseUrl: dir, sas, expiresOn } = await auth.dataAccess();
+    const { baseUrl: dir, sas } = await auth.dataAccess();
     const name = `r${n}_${file}`;
     await db.registerFileURL(name, `${dir}/${file}?${sas}`, duckdb.DuckDBDataProtocol.HTTP, false);
     await perf.time('attach', `ATTACH ${file}`, () => conn.query(`ATTACH '${name}' AS db (READ_ONLY);`));
     const old = _remote?.name;
-    _remote = { db, conn, file, name, n, expiresAt: Date.parse(expiresOn) };
+    _remote = { db, conn, file, name, n };
     if (old) await db.dropFile(old).catch(() => {});
   }
 
-  // Re-attach with a fresh SAS. `force` after a failed read (e.g. 403); otherwise only when the
-  // current SAS has expired. Concurrent callers share one re-attach.
+  // Re-attach with a fresh SAS — only after a failed read (403). No proactive re-attach: swapping
+  // the file under in-flight queries made their reads return zeros ("Corrupt database file").
+  // Concurrent callers share one re-attach.
   function ensureFresh(force = false) {
-    if (!_remote || (!force && Date.now() < _remote.expiresAt - REATTACH_MARGIN_MS)) return Promise.resolve();
+    if (!_remote || !force) return Promise.resolve();
     _reattaching ??= (async () => {
       const { db, conn, file, n } = _remote;
-      if (force) await auth.refresh();
+      await auth.refresh();
       await perf.time('attach', 'DETACH (re-attach with fresh SAS)', () => conn.query('DETACH db;'));
       await attachRemote(db, conn, file, n + 1);
     })().finally(() => { _reattaching = null; });
