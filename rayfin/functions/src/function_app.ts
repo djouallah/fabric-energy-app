@@ -36,13 +36,12 @@ function filesBase(ctx: StorageCtx): URL {
   return new URL(ctx.Secrets.ONELAKE_FILES_URL.replace(/\/+$/, ''));
 }
 
-// Window for both the delegation key and the SAS: now-skew .. +55 min, never past the
-// storage token's own expiry (OneLake rejects a key that outlives the token that requested it).
-function sasWindow(token: string): { start: Date; expiry: Date } {
-  const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8')) as { exp?: number };
+// Window for both the delegation key and the SAS: now-skew .. +55 min. OneLake caps the key window
+// (start..expiry) at 60 min; it does NOT cap it at the requesting token's expiry (tested), so a
+// nearly-expired storage token must not shorten the SAS.
+function sasWindow(): { start: Date; expiry: Date } {
   const now = Date.now();
-  const tokenExpiry = payload.exp ? payload.exp * 1000 - 60 * 1000 : Infinity;
-  return { start: new Date(now - CLOCK_SKEW_MS), expiry: new Date(Math.min(now + SAS_LIFETIME_MS, tokenExpiry)) };
+  return { start: new Date(now - CLOCK_SKEW_MS), expiry: new Date(now + SAS_LIFETIME_MS) };
 }
 
 async function getDelegationKey(base: URL, token: string, start: Date, expiry: Date): Promise<DelegationKey> {
@@ -94,7 +93,7 @@ udf.func(
   async (ctx: RayfinContext<BlankAppSchema, AudienceType.Storage>): Promise<{ baseUrl: string; sas: string; expiresOn: string }> => {
     const token = ctx.Tokens.Storage;
     const base = filesBase(ctx);
-    const { start, expiry } = sasWindow(token);
+    const { start, expiry } = sasWindow();
     const key = await getDelegationKey(base, token, start, expiry);
     return { baseUrl: `${base}/data`, sas: signFolderSas(base, 'data', 'r', key, start, expiry), expiresOn: iso(expiry) };
   },
