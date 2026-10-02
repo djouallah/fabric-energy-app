@@ -57,7 +57,11 @@
     .filter-tag:hover { background: #f85149; color: white; }
     .filter-tag::after { content: "\00d7"; font-size: 0.9rem; }
     .kpi-row { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 0.6rem; padding: 0.5rem 2rem; }
-    .kpi-card { min-width: 0; background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 0.5rem 0.8rem; }
+    .kpi-card { min-width: 0; background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 0.5rem 0.8rem; position: relative; }
+    .kpi-spark { position: absolute; right: 0.7rem; top: 1.45rem; width: 34%; height: 1.5rem; pointer-events: none; }
+    .kpi-card .kpi-delta { font-weight: 600; color: var(--text); min-height: 1.2em; }
+    .kpi-card .kpi-delta.up { color: #3fb950; }
+    .kpi-card .kpi-delta.down { color: #f85149; }
     .kpi-card .kpi-label { font-size: 0.65rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
     .kpi-card .kpi-value { font-size: 1.3rem; font-weight: 700; margin-top: 0.1rem; }
     .kpi-card .kpi-sub { font-size: 0.65rem; color: var(--muted); margin-top: 0.05rem; }
@@ -218,10 +222,10 @@
 
   <div id="view-dashboard" role="tabpanel" aria-labelledby="tab-dashboard">
   <div class="kpi-row">
-    <div class="kpi-card"><div class="kpi-label">Total Generation</div><div class="kpi-value" id="kpiGen">--</div><div class="kpi-sub" id="kpiGenSub">Average MW</div></div>
-    <div class="kpi-card"><div class="kpi-label">Avg Price</div><div class="kpi-value" id="kpiPrice">--</div><div class="kpi-sub">$/MWh across regions</div></div>
+    <div class="kpi-card"><div class="kpi-label">Total Generation</div><div class="kpi-value" id="kpiGen">--</div><svg class="kpi-spark" id="kpiGenSpark" aria-hidden="true"></svg><div class="kpi-sub" id="kpiGenSub">Average MW</div><div class="kpi-sub kpi-delta" id="kpiGenDelta"></div></div>
+    <div class="kpi-card"><div class="kpi-label">Avg Price</div><div class="kpi-value" id="kpiPrice">--</div><svg class="kpi-spark" id="kpiPriceSpark" aria-hidden="true"></svg><div class="kpi-sub">$/MWh across regions</div><div class="kpi-sub kpi-delta" id="kpiPriceDelta"></div></div>
     <div class="kpi-card"><div class="kpi-label">Active Generators</div><div class="kpi-value" id="kpiGens">--</div><div class="kpi-sub">DUIDs reporting</div></div>
-    <div class="kpi-card"><div class="kpi-label">Renewables</div><div class="kpi-value" id="kpiRE">--</div><div class="kpi-sub" id="kpiRESub">share of generation</div></div>
+    <div class="kpi-card"><div class="kpi-label">Renewables</div><div class="kpi-value" id="kpiRE">--</div><svg class="kpi-spark" id="kpiRESpark" aria-hidden="true"></svg><div class="kpi-sub" id="kpiRESub">share of generation</div><div class="kpi-sub kpi-delta" id="kpiREDelta"></div></div>
     <div class="kpi-card"><div class="kpi-label">Top Fuel Source</div><div class="kpi-value" id="kpiTopFuel">--</div><div class="kpi-sub" id="kpiTopFuelSub">by generation</div></div>
     <div class="kpi-card"><div class="kpi-label">Latest MW</div><div class="kpi-value" id="kpiLatestMW">--</div><div class="kpi-sub" id="kpiLatestMWSub">total generation</div></div>
     <div class="kpi-card"><div class="kpi-label">Latest Price</div><div class="kpi-value" id="kpiLatestPrice">--</div><div class="kpi-sub" id="kpiLatestPriceSub">avg $/MWh</div></div>
@@ -935,9 +939,52 @@
       }, true);
     }
     function setKpi(id, value, sub = '') {
-      document.getElementById(id).textContent = value;
+      const el = document.getElementById(id);
+      cancelAnimationFrame(_kpiAnim.get(id));
+      delete el.dataset.value;
+      el.textContent = value;
       const subEl = document.getElementById(id + 'Sub');
       if (subEl) subEl.textContent = sub;
+    }
+    // A numeric KPI counts from the value it replaces (from zero the first time) to the new one.
+    const _kpiAnim = new Map();
+    function setKpiNumber(id, value, format, sub) {
+      const el = document.getElementById(id);
+      cancelAnimationFrame(_kpiAnim.get(id));
+      const from = Number(el.dataset.value ?? 0);
+      el.dataset.value = value;
+      if (sub != null) document.getElementById(id + 'Sub').textContent = sub;
+      if (matchMedia('(prefers-reduced-motion: reduce)').matches) { el.textContent = format(value); return; }
+      const t0 = performance.now();
+      const tick = now => {
+        const t = Math.min(1, (now - t0) / 400);
+        el.textContent = format(from + (value - from) * (1 - Math.pow(1 - t, 3)));
+        if (t < 1) _kpiAnim.set(id, requestAnimationFrame(tick));
+      };
+      _kpiAnim.set(id, requestAnimationFrame(tick));
+    }
+    // Sparkline of a KPI's own series: an SVG line, averaged down to 80 points. `clip` keeps the
+    // scale to the 2nd-98th percentile so one price spike doesn't flatten the rest.
+    function setSpark(id, values, color, clip = false) {
+      const el = document.getElementById(id);
+      let v = values.filter(x => x != null && isFinite(x));
+      if (v.length < 2) { el.innerHTML = ''; return; }
+      if (clip) {
+        const s = [...v].sort((a, b) => a - b);
+        const lo = s[Math.floor(0.02 * s.length)], hi = s[Math.min(s.length - 1, Math.floor(0.98 * s.length))];
+        v = v.map(x => Math.min(hi, Math.max(lo, x)));
+      }
+      const n = Math.min(80, v.length), step = v.length / n;
+      const pts = Array.from({ length: n }, (_, i) => {
+        const part = v.slice(Math.floor(i * step), Math.max(Math.floor(i * step) + 1, Math.floor((i + 1) * step)));
+        return part.reduce((s, x) => s + x, 0) / part.length;
+      });
+      const min = Math.min(...pts), span = (Math.max(...pts) - min) || 1;
+      const W = 100, H = 24;
+      const line = pts.map((p, i) => `${(i * W / (n - 1)).toFixed(1)},${(H - 2 - (p - min) / span * (H - 4)).toFixed(1)}`).join(' ');
+      el.setAttribute('viewBox', `0 0 ${W} ${H}`);
+      el.setAttribute('preserveAspectRatio', 'none');
+      el.innerHTML = `<polyline points="${line}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round" vector-effect="non-scaling-stroke"/>`;
     }
 
     // --- Generation by Fuel Type (stacked area) ---
@@ -975,6 +1022,7 @@
       if (!data.length) {
         showEmpty('chart-generation');
         setKpi('kpiGen', '--'); setKpi('kpiTopFuel', '--');
+        setSpark('kpiGenSpark', []);
         return updateLatestMW(seq);
       }
 
@@ -1093,8 +1141,13 @@
       // KPIs: generation only, so charging (negative) rows are left out
       const uniqueIntervals = intraday ? xKeys.length : [...new Set(data.map(d => d.date))].length;
       const totalGen = data.reduce((s, d) => s + Math.max(d.total_mw, 0), 0) / (uniqueIntervals || 1);
-      document.getElementById('kpiGen').textContent = Math.round(totalGen).toLocaleString();
-      document.getElementById('kpiGenSub').textContent = intraday ? 'Average MW' : 'Average MWh/day';
+      setKpiNumber('kpiGen', totalGen, v => Math.round(v).toLocaleString(), intraday ? 'Average MW' : 'Average MWh/day');
+      const totalAt = new Map();
+      for (const d of data) {
+        const k = intraday ? `${d.date}|${padTime(d.time)}` : d.date;
+        totalAt.set(k, (totalAt.get(k) || 0) + Math.max(d.total_mw, 0));
+      }
+      setSpark('kpiGenSpark', xKeys.map(k => totalAt.get(k) ?? 0), cssVar('--accent'));
 
       const topFuel = Object.entries(seriesTotals).filter(([n]) => !n.endsWith(CHARGING)).sort((a, b) => b[1] - a[1])[0];
       if (topFuel) {
@@ -1123,7 +1176,7 @@
         GROUP BY sc.date, sc.time`);
       if (seq !== _renderSeq) return;
       if (latestMWResult.length) {
-        setKpi('kpiLatestMW', Math.round(latestMWResult[0].total_mw).toLocaleString(), `at ${formatTime(latestMWResult[0].time)}`);
+        setKpiNumber('kpiLatestMW', latestMWResult[0].total_mw, v => Math.round(v).toLocaleString(), `at ${formatTime(latestMWResult[0].time)}`);
       } else {
         setKpi('kpiLatestMW', '--');
       }
@@ -1138,6 +1191,7 @@
       if (!data.length) {
         showEmpty('chart-price');
         setKpi('kpiPrice', '--');
+        setSpark('kpiPriceSpark', []);
         return updateLatestPrice(seq);
       }
 
@@ -1199,7 +1253,14 @@
 
       // KPI: avg price
       const avgPrice = data.reduce((s, d) => s + d.avg_price, 0) / data.length;
-      document.getElementById('kpiPrice').textContent = '$' + avgPrice.toFixed(1);
+      setKpiNumber('kpiPrice', avgPrice, v => '$' + v.toFixed(1));
+      const priceAt = new Map();   // interval (day) -> [sum, regions]
+      for (const d of data) {
+        const k = intraday ? `${d.date}|${padTime(d.time)}` : d.date;
+        const acc = priceAt.get(k) ?? priceAt.set(k, [0, 0]).get(k);
+        acc[0] += d.avg_price; acc[1]++;
+      }
+      setSpark('kpiPriceSpark', xKeys.map(k => priceAt.has(k) ? priceAt.get(k)[0] / priceAt.get(k)[1] : null), '#d29922', true);
       await updateLatestPrice(seq);
     }
 
@@ -1216,7 +1277,7 @@
         GROUP BY p.date, p.time`);
       if (seq !== _renderSeq) return;
       if (latestPriceResult.length) {
-        setKpi('kpiLatestPrice', '$' + latestPriceResult[0].avg_price.toFixed(1), `at ${formatTime(latestPriceResult[0].time)}`);
+        setKpiNumber('kpiLatestPrice', latestPriceResult[0].avg_price, v => '$' + v.toFixed(1), `at ${formatTime(latestPriceResult[0].time)}`);
       } else {
         setKpi('kpiLatestPrice', '--');
       }
@@ -1244,11 +1305,59 @@
       const rows = await runQuery(renewableShareSql());
       if (seq !== _renderSeq) return;
       const re = rows.reduce((s, r) => s + r.re, 0), total = rows.reduce((s, r) => s + r.total, 0);
+      setSpark('kpiRESpark', total ? rows.map(r => r.total ? r.re / r.total : null) : [], '#3fb950');
       if (!total) return setKpi('kpiRE', '--', 'share of generation');
       let peak = null;
       for (const r of rows) if (r.total > 0 && (!peak || r.re / r.total > peak.share)) peak = { share: r.re / r.total, r };
       const when = peak.r.time != null ? `${formatDate(peak.r.date).replace(/ \d{4}$/, '')} ${formatTime(peak.r.time)}` : formatDate(peak.r.date);
-      setKpi('kpiRE', `${(100 * re / total).toFixed(1)}%`, `peak ${(100 * peak.share).toFixed(0)}% (${when})`);
+      setKpiNumber('kpiRE', 100 * re / total, v => `${v.toFixed(1)}%`, `peak ${(100 * peak.share).toFixed(0)}% (${when})`);
+    }
+
+    // Change against the days just before the range, as many as the range has. Both sides come
+    // from the daily views in one query each, so this never opens the 5-minute history. The
+    // newest day in the data is still filling and is left out of both sides.
+    async function updateKpiDeltas(seq) {
+      const show = (id, text = '', cls = '') => {
+        const el = document.getElementById(id);
+        el.textContent = text;
+        el.className = `kpi-sub kpi-delta ${cls}`;
+      };
+      const ids = ['kpiGenDelta', 'kpiPriceDelta', 'kpiREDelta'];
+      const { from, to } = getDateRange();
+      const maxDate = document.getElementById('dateTo').max, minDate = document.getElementById('dateFrom').min;
+      const shift = (d, n) => { const x = new Date(`${d}T00:00:00Z`); x.setUTCDate(x.getUTCDate() + n); return x.toISOString().slice(0, 10); };
+      const last = to >= maxDate ? shift(maxDate, -1) : to;
+      const days = Math.round((new Date(last) - new Date(from)) / 86400000) + 1;
+      const prevFrom = shift(from, -days);
+      if (!(days >= 1) || prevFrom < minDate || (!aggLoaded && prevFrom < _recentFrom)) return ids.forEach(id => show(id));
+
+      const dates = a => `${a}.date >= DATE ${sqlStr(prevFrom)} AND ${a}.date <= DATE ${sqlStr(last)}`;
+      const cur = a => `CAST(${a}.date >= DATE ${sqlStr(from)} AS INTEGER) AS cur`;
+      const out = 'GREATEST(sc.mwh, 0)';
+      const DIM = 'LEFT JOIN dim.dim_duid d ON sc.DUID = d.DUID';
+      const [gen, price, re] = await Promise.all([
+        runQuery(`SELECT ${cur('sc')}, (SUM(${out}) / COUNT(DISTINCT sc.date))::DOUBLE AS v
+          FROM v_scada_daily sc ${activeRegion() || activeFuel() ? DIM : ''}
+          WHERE ${[dates('sc'), ...sql.scadaFilters('sc.DUID')].join(' AND ')} GROUP BY ALL`),
+        runQuery(`SELECT ${cur('p')}, AVG(p.price)::DOUBLE AS v FROM v_price_daily p
+          WHERE ${[dates('p'), ...sql.priceFilters('p.REGIONID')].join(' AND ')} GROUP BY ALL`),
+        runQuery(`SELECT ${cur('sc')},
+            (100 * SUM(CASE WHEN ${FUEL} IN (${renewableSql()}) THEN ${out} ELSE 0 END)
+              / NULLIF(SUM(CASE WHEN ${FUEL} <> 'Grid' THEN ${out} ELSE 0 END), 0))::DOUBLE AS v
+          FROM v_scada_daily sc ${DIM}
+          WHERE ${[dates('sc'), ...sql.scadaFilters('sc.DUID', false)].join(' AND ')} GROUP BY ALL`),
+      ]);
+      if (seq !== _renderSeq) return;
+      const vs = days === 1 ? 'vs the day before' : `vs previous ${days} days`;
+      const pair = rows => [rows.find(r => r.cur === 1)?.v, rows.find(r => r.cur === 0)?.v];
+      const arrow = d => d >= 0 ? '▲' : '▼';
+      const [g1, g0] = pair(gen), [p1, p0] = pair(price), [r1, r0] = pair(re);
+      if (g1 == null || !g0) show(ids[0]);
+      else show(ids[0], `${arrow(g1 - g0)} ${Math.abs(100 * (g1 - g0) / g0).toFixed(1)}% ${vs}`);
+      if (p1 == null || p0 == null) show(ids[1]);
+      else show(ids[1], `${arrow(p1 - p0)} $${Math.abs(p1 - p0).toFixed(1)} ${vs}`);
+      if (r1 == null || r0 == null) show(ids[2]);
+      else show(ids[2], `${arrow(r1 - r0)} ${Math.abs(r1 - r0).toFixed(1)} pts ${vs}`, r1 >= r0 ? 'up' : 'down');
     }
 
     async function renderInsights(seq) {
@@ -2377,9 +2486,10 @@
         }
         const visible = id => document.getElementById(id).style.display !== 'none';
         await Promise.all([renderGeneration(seq), renderPrice(seq), renderMap(seq), updateRenewablesKpi(seq),
+          updateKpiDeltas(seq).catch(e => console.warn('[KPI] deltas unavailable:', e)),
           visible('view-insights') ? renderInsights(seq) : null,
           visible('view-flows') ? renderFlows(seq) : null,
-          runQuery(sql.generatorCount()).then(r => { if (seq === _renderSeq && r.length) document.getElementById('kpiGens').textContent = r[0].cnt.toLocaleString(); })
+          runQuery(sql.generatorCount()).then(r => { if (seq === _renderSeq && r.length) setKpiNumber('kpiGens', r[0].cnt, v => Math.round(v).toLocaleString()); })
         ]);
         if (seq !== _renderSeq) return;
         document.querySelectorAll('.charts').forEach(el => el.classList.remove('loading'));
@@ -2408,8 +2518,10 @@
       // Load year databases in background, then silently refresh
       // agg only feeds the daily-grain views (ranges over 30 days); don't redraw an intraday view.
       loadDailyAggDatabase().then(() => {
-        if (!isIntradayMode()) renderAll();
-        else setStatus(window._cutoffCached || "Connected", "connected");   // clear "Downloading..."
+        if (!isIntradayMode()) return renderAll();
+        setStatus(window._cutoffCached || "Connected", "connected");   // clear "Downloading..."
+        // The daily history is what a comparison with earlier days reads.
+        updateKpiDeltas(_renderSeq).catch(e => console.warn('[KPI] deltas unavailable:', e));
       })
         .catch(e => console.warn('[OPFS] Agg load failed:', e));
     }
