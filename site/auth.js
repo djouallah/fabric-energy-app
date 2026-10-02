@@ -54,8 +54,7 @@ function createRayfinAuth() {
     if (fresh(_data)) return _data;
     await init();
     _data = await perf.time('sas', 'getDataSas (function call)', () => _client.functions.getDataSas.invoke());
-    // How long the new SAS lives (capped by the function's storage-token expiry) — a short one
-    // means frequent re-attaches.
+    // How long the new SAS lives (the function signs ~55 min; data.js renews ~10 min before expiry).
     perf.log('info', `SAS valid ${((Date.parse(_data.expiresOn) - Date.now()) / 60000).toFixed(1)} min (expires ${_data.expiresOn})`);
     save(_data);
     return _data;

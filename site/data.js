@@ -8,6 +8,12 @@
 //      the blocks a query touches (Range requests); nothing is downloaded up front.
 // Both reads go to the OneLake data/ folder with a read-only SAS from the getDataSas function.
 //
+// The file is attached ONCE, by a URL without the SAS. A shim in the DuckDB worker appends the
+// current SAS to every request; the page renews the SAS ~10 min before it expires and pushes it to
+// the worker, so the hourly rotation never touches the attached database. A read that still fails
+// (403 after sleep/wake, or the "Corrupt database file" it leaves behind in duckdb-wasm's read-ahead
+// cache) is recovered by one DETACH/ATTACH under a new file name, then retried (app.js queryDb).
+//
 // Contract: after init(), schema `db` exists with
 //   fct_summary(date,time,DUID,mw,price,cutoff), dim_duid(...), dim_calendar(...).
 //
@@ -16,6 +22,23 @@
 
 import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.33.1-dev57.0/+esm";
 import { perf, HTTP_TRACE_SHIM } from "./perflog.js";
+
+const SAS_CHANNEL = 'duckdb-sas';
+const RENEW_AHEAD_MS = 10 * 60 * 1000;   // renew this long before the SAS expires (covers background-tab timer throttling)
+
+// Prepended to the DuckDB worker (before the trace shim and importScripts): every request under
+// DIR gets the current SAS appended. The first SAS is inlined so ATTACH cannot race a message;
+// renewals arrive on the BroadcastChannel.
+const sasShim = (dir, sas) => `(() => {
+  const DIR = ${JSON.stringify(dir)};
+  let sas = ${JSON.stringify(sas)};
+  try { new BroadcastChannel(${JSON.stringify(SAS_CHANNEL)}).onmessage = ({ data }) => { sas = data; }; } catch (e) {}
+  const sign = (u) => (typeof u === 'string' && u.startsWith(DIR)) ? u + (u.includes('?') ? '&' : '?') + sas : u;
+  const X = self.XMLHttpRequest;
+  if (X) self.XMLHttpRequest = class extends X { open(m, u, ...r) { return super.open(m, sign(u), ...r); } };
+  const F = self.fetch;
+  if (F) self.fetch = (input, init) => F(typeof input === 'string' ? sign(input) : input, init);
+})();`;
 
 export function createDataSource(auth, { onStatus = () => {} } = {}) {
   // Resolve the moving `latest.txt` pointer to a concrete db filename.
@@ -30,7 +53,7 @@ export function createDataSource(auth, { onStatus = () => {} } = {}) {
       return r;
     };
     let resp = await fetchLatest();
-    if (resp.status === 403) { await auth.refresh(); resp = await fetchLatest(); }   // expired SAS
+    if (resp.status === 403) { await renew(); resp = await fetchLatest(); }   // expired SAS
     if (!resp.ok) throw new Error(`Failed to read data/latest.txt: HTTP ${resp.status}`);
     const fname = (await resp.text()).trim();
     if (!fname) throw new Error('data/latest.txt is empty');
@@ -38,52 +61,64 @@ export function createDataSource(auth, { onStatus = () => {} } = {}) {
     return fname;
   }
 
-  // Free the full .duckdb copies that earlier (download-to-OPFS) versions left in this browser.
-  async function evictOPFSCopies() {
-    try {
-      const root = await navigator.storage.getDirectory();
-      for await (const [name] of root.entries()) {
-        if (/^data.*\.duckdb$/.test(name)) await root.removeEntry(name).catch(() => {});
-      }
-    } catch (e) { /* no OPFS: nothing to free */ }
+  // --- SAS renewal: sign a new one and push it to the worker ---
+  const sasChannel = new BroadcastChannel(SAS_CHANNEL);
+  let _renewTimer = null;
+
+  function scheduleRenew(expiresOn) {
+    clearTimeout(_renewTimer);
+    _renewTimer = setTimeout(() => renew().catch(e => console.error('[data] SAS renewal failed', e)),
+                             Math.max(Date.parse(expiresOn) - Date.now() - RENEW_AHEAD_MS, 0));
   }
 
-  // Attach once. The SAS (55 min) is part of the file URL; when a read fails with 403 the caller
-  // forces one re-attach with a fresh SAS and retries (~1/hour).
-  let _remote = null;        // { db, conn, file, name, n }
-  let _reattaching = null;
+  async function renew() {
+    await auth.refresh();
+    const { sas, expiresOn } = await auth.dataAccess();
+    sasChannel.postMessage(sas);
+    scheduleRenew(expiresOn);
+  }
 
-  async function attachRemote(db, conn, file, n = 0) {
-    const { baseUrl: dir, sas } = await auth.dataAccess();
+  // --- Attach ---
+  let _remote = null;        // { db, conn, dir, file, name, n }
+  let _recovering = null;
+
+  async function attachRemote(db, conn, dir, file, n = 0) {
     const name = `r${n}_${file}`;
-    await db.registerFileURL(name, `${dir}/${file}?${sas}`, duckdb.DuckDBDataProtocol.HTTP, false);
+    // A distinct URL per registration (duckdb-wasm also indexes files by URL); the shim adds the SAS.
+    const url = n ? `${dir}/${file}?v=${n}` : `${dir}/${file}`;
+    await db.registerFileURL(name, url, duckdb.DuckDBDataProtocol.HTTP, false);
     await perf.time('attach', `ATTACH ${file}`, () => conn.query(`ATTACH '${name}' AS db (READ_ONLY);`));
     const old = _remote?.name;
-    _remote = { db, conn, file, name, n };
+    _remote = { db, conn, dir, file, name, n };
     if (old) await db.dropFile(old).catch(() => {});
   }
 
-  // Re-attach with a fresh SAS — only after a failed read (403). No proactive re-attach: swapping
-  // the file under in-flight queries made their reads return zeros ("Corrupt database file").
-  // Concurrent callers share one re-attach.
-  function ensureFresh(force = false) {
-    if (!_remote || !force) return Promise.resolve();
-    _reattaching ??= (async () => {
-      const { db, conn, file, n } = _remote;
-      await auth.refresh();
-      await perf.time('attach', 'DETACH (re-attach with fresh SAS)', () => conn.query('DETACH db;'));
-      await attachRemote(db, conn, file, n + 1);
-    })().finally(() => { _reattaching = null; });
-    return _reattaching;
+  // Fallback after a failed read: fresh SAS, then re-attach under a NEW file name. The new name
+  // gives duckdb-wasm a new file id, which orphans the read-ahead window the failed read poisoned
+  // (that window is what yields "Corrupt database file ... stored checksum 0" on the next reads).
+  // Concurrent callers share one recovery.
+  function recover() {
+    if (!_remote) return Promise.resolve();
+    _recovering ??= (async () => {
+      const { db, conn, dir, file, n } = _remote;
+      await renew();
+      await perf.time('attach', 'DETACH (recover after failed read)', () => conn.query('DETACH db;'));
+      await attachRemote(db, conn, dir, file, n + 1);
+    })().finally(() => { _recovering = null; });
+    return _recovering;
   }
 
   async function init() {
     onStatus("Loading DuckDB WASM...");
+    // The worker shim needs the data dir + a SAS before the bundle loads.
+    const { baseUrl: dir, sas, expiresOn } = await auth.dataAccess();
+    scheduleRenew(expiresOn);
+
     const JSDELIVR_BUNDLES = duckdb.getJsDelivrBundles();
     const bundle = await duckdb.selectBundle(JSDELIVR_BUNDLES);
     const workerUrl = URL.createObjectURL(
-      // HTTP_TRACE_SHIM: times every HTTP request DuckDB makes (seeks) for the Logs tab.
-      new Blob([HTTP_TRACE_SHIM, `\nimportScripts("${bundle.mainWorker}");`], { type: "text/javascript" })
+      // sasShim signs every data request; HTTP_TRACE_SHIM (on top) times them for the Logs tab.
+      new Blob([sasShim(dir, sas), '\n', HTTP_TRACE_SHIM, `\nimportScripts("${bundle.mainWorker}");`], { type: "text/javascript" })
     );
     const worker = new Worker(workerUrl);
     const logger = new duckdb.ConsoleLogger();
@@ -103,13 +138,12 @@ export function createDataSource(auth, { onStatus = () => {} } = {}) {
     // No fallback: if OneLake is unreachable the dashboard must say so.
     const dbFile = await resolveLatestDuckDB();
     onStatus("Opening database...");
-    await attachRemote(db, conn, dbFile);
-    await evictOPFSCopies();
+    await attachRemote(db, conn, dir, dbFile);
     console.log(`[data] ${dbFile}: attached remotely (HTTP range reads)`);
     await conn.query("SET preserve_insertion_order = false;");
 
     return { db, conn };
   }
 
-  return { init, ensureFresh };
+  return { init, recover };
 }
