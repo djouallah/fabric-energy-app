@@ -434,7 +434,13 @@
 
     const charts = {};
     function getChart(id) {
-      if (!charts[id]) charts[id] = echarts.init(document.getElementById(id), 'dark-custom');
+      if (!charts[id]) {
+        const el = document.getElementById(id);
+        charts[id] = echarts.init(el, 'dark-custom');
+        // The card can be laid out after init (loading/hidden tab), and echarts keeps its init size
+        // until resize() — follow the container, not just the window.
+        new ResizeObserver(() => charts[id].resize()).observe(el);
+      }
       return charts[id];
     }
     window.addEventListener('resize', () => { Object.values(charts).forEach(c => c.resize()); });
@@ -792,6 +798,22 @@
     }
     perf.onChange(() => { _logsFrame ||= requestAnimationFrame(renderLogs); });
     document.getElementById('logsClear').onclick = () => perf.clear();
+    // Copy: summary + table as TSV (pastes cleanly into chat or a spreadsheet).
+    document.getElementById('logsCopy').onclick = async (e) => {
+      const rows = [...document.querySelectorAll('#logsTable tr')].map(tr => [...tr.cells].map(c => c.textContent).join('\t'));
+      const text = document.getElementById('logsSummary').textContent + '\n' + rows.join('\n');
+      const btn = e.currentTarget;
+      try { await navigator.clipboard.writeText(text); btn.textContent = 'Copied'; }
+      catch {
+        // Fabric iframe may deny the Clipboard API — fall back to a selected textarea + execCommand.
+        const ta = Object.assign(document.createElement('textarea'), { value: text });
+        ta.style.cssText = 'position:fixed;opacity:0';
+        document.body.appendChild(ta); ta.select();
+        btn.textContent = document.execCommand('copy') ? 'Copied' : 'Copy failed';
+        ta.remove();
+      }
+      setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+    };
 
     // --- Tab switching ---
     for (const btn of document.querySelectorAll('.tab-btn')) {
