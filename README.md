@@ -25,7 +25,7 @@ It is the same dashboard as [NemTracker](https://nemtracker.github.io/), hosted 
 This is an experiment. Read these before you copy it:
 
 - **Security is per table, not per row.** Only people the app is shared with in Fabric can sign in
-  and read the data. For them, access is all or nothing per table: there is no row-level or
+  and read the data. For them, there is no row-level or
   column-level security (RLS / CLS). If different users must see different rows or columns, use
   something else.
 - **Single-threaded.** The query engine runs in the browser (WebAssembly) on one thread: a heavy
