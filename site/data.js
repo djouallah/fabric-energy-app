@@ -21,7 +21,7 @@
 // DOM-free: progress is reported through the injected `onStatus` callback.
 // =============================================================================
 
-import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.32.0/+esm";
+import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.33.1-dev57.0/+esm";
 import { perf, HTTP_TRACE_SHIM } from "./perflog.js";
 
 export function createDataSource(cfg = {}, auth, { onStatus = () => {} } = {}) {
