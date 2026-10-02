@@ -32,9 +32,9 @@ rayfin/.temp/
 # Claude Code harness config (local)
 .claude/
 
-# Agent context — local only, never on the deploy repo
+# Rayfin's generated agent context — local only. AGENTS.md is tracked: it is the guide an
+# agent needs to reproduce this repo.
 .agents/
-AGENTS.md
 .mcp.json
 
 # Local design docs — kept on disk, not shipped to the deploy repo
