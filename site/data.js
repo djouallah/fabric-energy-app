@@ -172,8 +172,15 @@ export function createDataSource(cfg = {}, auth, { onStatus = () => {} } = {}) {
     const db = new duckdb.AsyncDuckDB(logger, worker);
     await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
     URL.revokeObjectURL(workerUrl);
+    // duckdb-wasm defaults forceFullHTTPReads to TRUE: an HTTP file is then GET'd whole (1.3 GB)
+    // instead of Range-read. Turn it off so remote ATTACH only reads the blocks it touches.
+    await db.open({ filesystem: { forceFullHTTPReads: false } });
 
     const conn = await db.connect();
+    // OneLake answers `HEAD` + Range with 200 (not 206). With reliable_head_requests on (default),
+    // the Range probe never learns the file size and falls back to a full GET; off, it takes the
+    // size from the HEAD Content-Length and uses Range reads.
+    await conn.query("SET reliable_head_requests = false;");
 
     // No fallback to a bundled copy: if OneLake is unreachable the dashboard must say so, not
     // silently show stale demo data.
