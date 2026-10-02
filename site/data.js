@@ -27,8 +27,8 @@ import { perf, HTTP_TRACE_SHIM } from "./perflog.js?v=__BUILD__";
 
 const SAS_CHANNEL = 'duckdb-sas';
 const RENEW_AHEAD_MS = 10 * 60 * 1000;   // renew this long before the SAS expires (covers background-tab timer throttling)
-const CHUNK = 8 * 1024 * 1024;           // hot-file download: Range size per request ...
-const PARALLEL = 6;                      // ... and how many in flight (one stream is ~4 MB/s from West Europe)
+const CHUNK = 2 * 1024 * 1024;           // hot-file download: Range size per request ...
+const PARALLEL = 6;                      // ... and how many in flight (a 14 MB file needs small chunks to use them all)
 
 // Prepended to the DuckDB worker (before the trace shim and importScripts): every request under
 // DIR gets the current SAS appended. The first SAS is inlined so ATTACH cannot race a message;
@@ -130,15 +130,22 @@ export function createDataSource(auth, { onStatus = () => {} } = {}) {
     } catch (e) { console.warn('[data] OPFS cache unavailable:', e?.message || e); }
   }
 
-  async function attachHot(hotName) {
+  // Needs no DuckDB: init() starts it while the WASM bundle is still loading.
+  async function loadHot() {
+    fullFile = await resolveLatestDuckDB();
+    const hotName = fullFile.replace(/^data_/, 'hot_');
     let bytes = await opfsRead(hotName);
     const source = bytes ? 'OPFS' : 'download';
     if (!bytes) {
-      onStatus('Downloading data...');
       bytes = await perf.time('fetch', `GET ${hotName} (whole, ${PARALLEL} parallel)`, () => download(hotName));
+      // Awaited: registerFileBuffer transfers (detaches) the buffer to the worker afterwards.
       await opfsWrite(hotName, bytes);
     }
     perf.log('info', `${hotName}: ${(bytes.length / 1048576).toFixed(1)} MB from ${source}`);
+    return { hotName, bytes };
+  }
+
+  async function attachHot({ hotName, bytes }) {
     onStatus('Opening database...');
     await db.registerFileBuffer(hotName, bytes);
     await perf.time('attach', `ATTACH ${hotName} (local)`, () => conn.query(`ATTACH '${hotName}' AS db (READ_ONLY);`));
@@ -187,6 +194,10 @@ export function createDataSource(auth, { onStatus = () => {} } = {}) {
     const access = await auth.dataAccess();
     dir = access.baseUrl;
     scheduleRenew(access.expiresOn);
+    // latest.txt + the hot file don't need DuckDB: fetch them while the WASM bundle boots.
+    // No fallback: if OneLake is unreachable the dashboard must say so (the await below rethrows).
+    const hot = loadHot();
+    hot.catch(() => {});
 
     const JSDELIVR_BUNDLES = duckdb.getJsDelivrBundles();
     const bundle = await duckdb.selectBundle(JSDELIVR_BUNDLES);
@@ -209,9 +220,8 @@ export function createDataSource(auth, { onStatus = () => {} } = {}) {
     // size from the HEAD Content-Length and uses Range reads.
     await conn.query("SET reliable_head_requests = false;");
 
-    // No fallback: if OneLake is unreachable the dashboard must say so.
-    fullFile = await resolveLatestDuckDB();
-    await attachHot(fullFile.replace(/^data_/, 'hot_'));
+    onStatus('Downloading data...');
+    await attachHot(await hot);
     await conn.query("SET preserve_insertion_order = false;");
 
     return { db, conn };
