@@ -38,7 +38,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -q duckdb --pre --upgrade
+          pip install -q duckdb --upgrade
           pip install -q azure-identity azure-storage-file-datalake
 
       - name: Import
