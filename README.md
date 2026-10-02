@@ -28,6 +28,8 @@ This is an experiment. Read these before you copy it:
   and read the data. For them, there is no row-level or
   column-level security (RLS / CLS). If different users must see different rows or columns, use
   something else.
+- **No public access.** Every visitor has to sign in with a Fabric account the app is shared with.
+  As far as I can tell, it cannot be opened anonymously.
 - **Single-threaded.** The query engine runs in the browser (WebAssembly) on one thread: a heavy
   query blocks until it finishes, and more cores do not help. This may change in the future.
 - **Limited by the browser.** A tab gets about 4 GB of memory; a query that needs more fails. Phones
