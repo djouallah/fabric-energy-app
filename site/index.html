@@ -1,8 +1,8 @@
 <!DOCTYPE html>
-<!-- Vendored from github.com/djouallah/analytics-as-code, dashboard/index.html @ b7e6051.
+<!-- Vendored from github.com/djouallah/analytics-as-code, dashboard/index.html @ 1cc94da.
      Same dashboard; only hosting and data loading differ, and every local change is marked FABRIC.
      To pick up upstream changes (run in this repo):
-       git -C <analytics-as-code> diff b7e6051..HEAD -- dashboard/index.html | git apply -p2 --directory=site
+       git -C <analytics-as-code> diff 1cc94da..HEAD -- dashboard/index.html | git apply -p2 --directory=site
      then update the sha above. -->
 <html lang="en">
 <head>
@@ -2112,8 +2112,9 @@
           label: { fontSize: 10, formatter: '{b}' },
           upperLabel: { show: true, height: 16, fontSize: 10, fontWeight: 600, color: cssVar('--text') },
           levels: [
-            { itemStyle: { gapWidth: 3, borderWidth: 0 } },
-            { itemStyle: { borderColor: cssVar('--row-line'), borderWidth: 2, gapWidth: 1 } },
+            // The gaps between a node's children are drawn in its border colour (white by default).
+            { itemStyle: { borderColor: cssVar('--card'), gapWidth: 3, borderWidth: 0 }, upperLabel: { show: false } },
+            { itemStyle: { borderColor: cssVar('--border'), borderWidth: 2, gapWidth: 1 } },
             { itemStyle: { borderColor: cssVar('--card'), borderWidth: 0 } },
           ],
           data: [...owners.values()] }],
