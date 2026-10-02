@@ -1,9 +1,9 @@
 {
-  "name": "rayfin-duckdb-wasm",
+  "name": "fabric-energy-app",
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "description": "DuckDB-WASM dashboard on Rayfin/Fabric static hosting, reading data directly from OneLake",
+  "description": "Australian energy market dashboard, built as a Microsoft Fabric app",
   "scripts": {
     "build:fabric": "node build.mjs",
     "rayfin:up": "rayfin up"
